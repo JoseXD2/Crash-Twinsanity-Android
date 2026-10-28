@@ -151,6 +151,26 @@ bool DualSourceBlend()
     return answer;
 }
 
+bool FramebufferFetch()
+{
+    if (!Es)
+    {
+        return false;
+    }
+
+    static thread_local SDL_GLContext askedOn = nullptr;
+    static thread_local bool answer = false;
+    SDL_GLContext current = SDL_GL_GetCurrentContext();
+    if (askedOn != current || current == nullptr)
+    {
+        askedOn = current;
+        const char* forced = std::getenv("TWIN_GLES_NO_FETCH");
+        answer = (forced == nullptr || forced[0] == '0') && HasExtension("GL_EXT_shader_framebuffer_fetch");
+    }
+
+    return answer;
+}
+
 std::string Shader(const char* source)
 {
     return Shader(std::string(source));
@@ -174,9 +194,18 @@ std::string Shader(const std::string& given)
         }
         else
         {
-            // No dual-source blend: the factor output is a plain variable nothing reads (the renderer blends in the shader)
+            // No dual-source blend: the factor output is a plain variable nothing reads (the renderer blends in the shader,
+            // reading the destination from the framebuffer itself where the GPU lets a shader, else from a copy)
             ReplaceAll(text, "layout(location = 0, index = 1) out vec4 outFactor;", "vec4 outFactor;");
-            ReplaceAll(text, "layout(location = 0, index = 0) out vec4 outColour;", "layout(location = 0) out vec4 outColour;");
+            if (text.find("#define FBFETCH 1") != std::string::npos)
+            {
+                head += "#extension GL_EXT_shader_framebuffer_fetch : require\n";
+                ReplaceAll(text, "layout(location = 0, index = 0) out vec4 outColour;", "layout(location = 0) inout highp vec4 outColour;");
+            }
+            else
+            {
+                ReplaceAll(text, "layout(location = 0, index = 0) out vec4 outColour;", "layout(location = 0) out vec4 outColour;");
+            }
         }
     }
 

@@ -5,6 +5,7 @@
 // from the menus' hints (the bottom corners)
 #include "ui/nativeui.h"
 #include "ui/overlayinternal.h"
+#include "ui/touch.h"
 
 #include <atomic>
 #include <cmath>
@@ -78,7 +79,7 @@ void AddFpsCounter(std::vector<OverlayFrame::Command>* commands, int pixelWidth,
     f32 offsetY;
     ReferenceMapping(static_cast<f32>(pixelWidth), static_cast<f32>(pixelHeight), &scale, &offsetX, &offsetY);
     f32 left = -offsetX / scale + Margin;
-    f32 top = -offsetY / scale + Margin;
+    f32 top = -offsetY / scale + Margin + TouchControlsTopInset();
     TextStyle style;
     style.font = OverlayFont::BodyBold;
     style.size = TextSize;

@@ -37,6 +37,9 @@ void ReportShaderFailure(const char* what, const char* log, const std::string& s
 // Whether the current context has an extension (GL_... name), and the dual-source blend (GL 3.3: always; ES: the extension)
 bool HasExtension(const char* name);
 bool DualSourceBlend();
+// ES: whether the fragment shader can read the framebuffer's pixel (GL_EXT_shader_framebuffer_fetch): the renderer's shader
+// blend then reads the destination there, with no copy of the target before each batch (GL 3.3: never)
+bool FramebufferFetch();
 
 // An offscreen context: a hidden window's, or on Android the window's with no surface
 struct Context

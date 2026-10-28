@@ -15,6 +15,8 @@ struct BoundPad;
 
 // Whether the touch controls are in use: Android (and $TWIN_TOUCH=1 to try them elsewhere)
 bool TouchControlsEnabled();
+// How far down from the window's top the controls' top row reaches (the FPS counter sits below it), 0 without them
+f32 TouchControlsTopInset();
 // Watches the touch events (once, from the pad's read)
 void StartTouchControls();
 // The touch controls' buttons and sticks added to the pad's read; the controls are read only while the game's window shows the

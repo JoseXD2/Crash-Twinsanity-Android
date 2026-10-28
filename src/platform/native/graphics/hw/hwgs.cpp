@@ -32,6 +32,7 @@
 
 #include "gl.h"
 #include "../glcompat.h"
+#include "native.h"
 #include "replace.h"
 
 #define XXH_INLINE_ALL
@@ -568,7 +569,7 @@ void main()
 #endif
 #if SHADERBLEND
     // The destination (a copy of the target from before the batch) and the GS's own blend, mask and tests on it
-    vec4 d = floor(texelFetch(destination, ivec2(gl_FragCoord.xy), 0) * 255.0 + 0.5);
+    vec4 d = floor(DESTINATION * 255.0 + 0.5);
 #if FRAME16
     d.rgb = floor(d.rgb / 8.0) * 8.0;
     d.a = d.a >= 128.0 ? 128.0 : 0.0;
@@ -1459,6 +1460,13 @@ bool HwGs::Init()
         return false;
     }
 
+    if (IsEs())
+    {
+        Native::Log("graphics: OpenGL ES: dual-source blend %s, framebuffer fetch %s, anisotropy %s",
+                    NativeGl::DualSourceBlend() ? "yes" : "no (the shader blends)", NativeGl::FramebufferFetch() ? "yes" : "no",
+                    HasAnisotropy() ? "yes" : "no");
+    }
+
     Gl& gl = GetGl();
     gl.GenVertexArrays(1, &vertexArray_);
     gl.GenBuffers(1, &vertexBuffer_);
@@ -1520,6 +1528,11 @@ const Program& HwGs::ProgramFor(u32 bits)
     define("FRAME24", (bits & BitFrame24) ? 1 : 0);
     define("WRAPADD", (bits & BitWrapAdd) ? 1 : 0);
     define("NATIVEDEPTH", (bits & BitNativeDepth) ? 1 : 0);
+    // The shader blend's destination: the framebuffer's own pixel where the GPU lets a fragment shader read it (OpenGL ES with
+    // GL_EXT_shader_framebuffer_fetch: no copy of the target before the batch), else the copy made before the batch
+    bool fetch = (bits & BitShaderBlend) && !NativeGl::DualSourceBlend() && NativeGl::FramebufferFetch();
+    define("FBFETCH", fetch ? 1 : 0);
+    header += fetch ? "#define DESTINATION outColour\n" : "#define DESTINATION texelFetch(destination, ivec2(gl_FragCoord.xy), 0)\n";
     GLuint vertex = CompileShader(GL_VERTEX_SHADER, VertexSource);
     GLuint fragment = CompileShader(GL_FRAGMENT_SHADER, header + FragmentSource);
     Gl& gl = GetGl();
@@ -4770,7 +4783,9 @@ void HwGs::Flush()
                              depthStencil->stencilAlphaVersion == k.colour->alphaVersion &&
                              std::memcmp(depthStencil->stencilScissor, k.scissor, sizeof(k.scissor)) == 0;
     GLuint destination = 0;
-    if ((k.program & BitShaderBlend) || (k.stencilDate && !stencilKept))
+    // (the shader reads the framebuffer itself where it can: no copy for its blend)
+    static const bool fetch = !NativeGl::DualSourceBlend() && NativeGl::FramebufferFetch();
+    if (((k.program & BitShaderBlend) && !fetch) || (k.stencilDate && !stencilKept))
     {
         // The shader's blend reads the batch's rectangle; the stencil's pass the whole scissor
         Rect region = {0x7FFF, 0x7FFF, -1, -1};
@@ -5016,10 +5031,13 @@ void HwGs::Flush()
 
         if (k.program & BitShaderBlend)
         {
-            gl.ActiveTexture(GL_TEXTURE0 + 1);
-            gl.BindTexture(GL_TEXTURE_2D, destination);
-            gl.ActiveTexture(GL_TEXTURE0);
-            gl.Uniform1i(p.destination, 1);
+            if (destination != 0)
+            {
+                gl.ActiveTexture(GL_TEXTURE0 + 1);
+                gl.BindTexture(GL_TEXTURE_2D, destination);
+                gl.ActiveTexture(GL_TEXTURE0);
+                gl.Uniform1i(p.destination, 1);
+            }
             bool blending = k.gsBlend[0] != 0 || k.gsBlend[1] != 0 || k.gsBlend[2] != 0 || k.gsBlend[3] != 0 || k.gsFix != 0;
             gl.Uniform1i(p.blendOn, blending ? 1 : 0);
             gl.Uniform1i(p.blendA, static_cast<GLint>(k.gsBlend[0]));

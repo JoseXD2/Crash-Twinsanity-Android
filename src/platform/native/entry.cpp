@@ -217,6 +217,8 @@ int main(int argc, char** argv)
     StartLogcat();
     // The frames' statistics in the log (display.cpp: a line every 60 pictures), while the port's speed on phones is found out
     setenv("TWIN_FRAME_STATS", "1", 0);
+    // And the hardware renderer's counts of its downloads, readbacks and copies, with their reasons (hwgs.cpp)
+    setenv("TWIN_HW_STATS", "1", 0);
 #endif
     // What the log leaves out of its paths (the profile folder), before its first line
     Native::StartLogPrivacy();

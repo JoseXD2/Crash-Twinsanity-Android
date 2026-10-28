@@ -205,10 +205,9 @@ bool WatchTouchEvents(void*, SDL_Event* event)
         }
         else if (x < (l.left + l.right) * 0.5f)
         {
-            // The stick floats: it appears where the finger lands (within the area the resting stick is drawn in, or anywhere
-            // in the left half below the shoulders)
-            bool nearRest = std::hypot(x - l.stickX, y - l.stickY) <= StickRadius * 1.6f;
-            if (nearRest || y > l.top + Margin + ShoulderHeight + 20.0f)
+            // The stick: a finger landing on it (or just around it) takes it, from where it landed
+            bool nearRest = std::hypot(x - l.stickX, y - l.stickY) <= StickRadius * 1.3f;
+            if (nearRest)
             {
                 f.role = Role::Stick;
                 bool other = std::any_of(g_Fingers.begin(), g_Fingers.end(), [](const Finger& g) { return g.role == Role::Stick; });
@@ -302,6 +301,11 @@ void Label(std::vector<OverlayFrame::Command>* commands, const std::string& text
     line.textStyle = style;
     commands->push_back(line);
 }
+}
+
+f32 TouchControlsTopInset()
+{
+    return TouchControlsEnabled() ? Margin + ShoulderHeight + 8.0f : 0.0f;
 }
 
 bool TouchControlsEnabled()
@@ -450,18 +454,12 @@ void AddTouchControls(std::vector<OverlayFrame::Command>* commands, int pixelWid
     const Rgba32 pressed = Hex(0xffffff, 0.45f);
     const Rgba32 ring = Hex(0xffffff, 0.55f);
     // The left stick: its base where it rests, or where the finger holds it
-    f32 sx = g_StickHeld ? g_StickCentreX : l.stickX;
-    f32 sy = g_StickHeld ? g_StickCentreY : l.stickY;
+    f32 sx = l.stickX;
+    f32 sy = l.stickY;
     Circle(commands, sx, sy, StickRadius, idle, ring, 3.0f);
     Circle(commands, sx + g_StickX * StickRadius * (g_StickHeld ? 1.0f : 0.0f), sy + g_StickY * StickRadius * (g_StickHeld ? 1.0f : 0.0f),
            KnobRadius, g_StickHeld ? pressed : Hex(0xffffff, 0.3f), ring, 2.0f);
-    // The camera's drag, while held
-    if (g_CameraHeld)
-    {
-        Circle(commands, g_CameraCentreX, g_CameraCentreY, CameraRadius * 0.5f, Hex(0x000000, 0.15f), Hex(0xffffff, 0.3f), 2.0f);
-        Circle(commands, g_CameraCentreX + g_CameraX * CameraRadius * 0.5f, g_CameraCentreY + g_CameraY * CameraRadius * 0.5f, 22.0f,
-               Hex(0xffffff, 0.35f), ring, 2.0f);
-    }
+    // (the camera's drag draws nothing: a drag anywhere free in the right part turns it)
 
     // The face buttons: the PlayStation's art on a disc
     const OverlayImage art[4] = {OverlayImage::PlayStationCross, OverlayImage::PlayStationCircle, OverlayImage::PlayStationSquare,
