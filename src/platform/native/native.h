@@ -100,6 +100,13 @@ void Log(const char* format, ...) __attribute__((format(printf, 1, 2)));
 [[noreturn]] void Fatal(const char* format, ...) __attribute__((format(printf, 1, 2)));
 // The seconds since the program started (the log's)
 double SessionSeconds();
+// The calling thread kept to the machine's fastest cores and given a high priority (Android and Linux: by the cores' top
+// frequencies; elsewhere nothing). The game's, VU1's and the render thread: a phone's scheduler otherwise leaves them on its
+// small cores
+void PinToFastCores(const char* name);
+// The sampling profiler (profiler_posix.cpp, $TWIN_PROFILE): the threads it samples register themselves (PinToFastCores does)
+void RegisterProfiledThread(const char* name);
+void StartProfiler();
 
 // The session in the log (sessionlog.cpp), for the bug reports: logs go to public issues, so the paths in it name the profile
 // folder %USERPROFILE% (and a folder named as the user or the computer %USERNAME%, %COMPUTERNAME%): text with them replaced. Ready

@@ -99,6 +99,10 @@ bool LoadGl()
     }
     ok &= Load(g_Gl.DrawBuffers, "glDrawBuffers");
     ok &= Load(g_Gl.GetIntegerv, "glGetIntegerv");
+    ok &= Load(g_Gl.GenSamplers, "glGenSamplers");
+    ok &= Load(g_Gl.BindSampler, "glBindSampler");
+    ok &= Load(g_Gl.SamplerParameteri, "glSamplerParameteri");
+    ok &= Load(g_Gl.SamplerParameterf, "glSamplerParameterf");
     ok &= Load(g_Gl.Viewport, "glViewport");
     ok &= Load(g_Gl.Scissor, "glScissor");
     ok &= Load(g_Gl.Enable, "glEnable");

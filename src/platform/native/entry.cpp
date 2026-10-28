@@ -44,10 +44,6 @@ extern "C"
 namespace Native
 {
 void StartLowMemory();
-#if defined(_WIN32)
-// $TWIN_PROFILE (profiler_win32.cpp)
-void StartProfiler();
-#endif
 }
 
 namespace
@@ -246,6 +242,14 @@ int main(int argc, char** argv)
     }
     Native::StartLowMemory();
     Native::StartHangWatch();
+#if defined(__ANDROID__)
+    Native::PinToFastCores("the game's thread");
+    // The sampling profiler, while the port's speed on phones is found out: 20 s after 20 s, to the log
+    setenv("TWIN_PROFILE", "1", 0);
+#endif
+#if !defined(_WIN32)
+    Native::StartProfiler();
+#endif
     for (int i = 1; i < argc; i++)
     {
         if (std::string_view(argv[i]) == "--selftest-lowmemory")

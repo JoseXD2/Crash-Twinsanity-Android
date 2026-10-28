@@ -49,11 +49,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <array>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -985,6 +987,8 @@ void main()
 struct Program
 {
     GLuint id = 0;
+    // Each uniform's last value set (by location): a batch sets only what changed, as a mobile driver's uniform calls cost
+    mutable std::unordered_map<GLint, std::array<u32, 16>> last;
     GLint viewSize;
     GLint viewOrigin;
     GLint depthCopy;
@@ -1019,6 +1023,102 @@ struct Program
     GLint colclamp;
     GLint datm;
     GLint frameMask;
+};
+
+// A uniform set when its value changed since the program last set it (the location -1, an inactive uniform, never)
+template <typename T, size_t N>
+bool UniformChanged(const Program& p, GLint location, const T (&values)[N])
+{
+    static_assert(sizeof(T) * N <= 16 * sizeof(u32));
+    if (location < 0)
+    {
+        return false;
+    }
+
+    std::array<u32, 16> packed{};
+    std::memcpy(packed.data(), values, sizeof(T) * N);
+    auto found = p.last.find(location);
+    if (found != p.last.end() && found->second == packed)
+    {
+        return false;
+    }
+
+    p.last[location] = packed;
+    return true;
+}
+
+void Set1i(Gl& gl, const Program& p, GLint location, GLint v)
+{
+    GLint values[1] = {v};
+    if (UniformChanged(p, location, values))
+    {
+        gl.Uniform1i(location, v);
+    }
+}
+
+void Set1ui(Gl& gl, const Program& p, GLint location, GLuint v)
+{
+    GLuint values[1] = {v};
+    if (UniformChanged(p, location, values))
+    {
+        gl.Uniform1ui(location, v);
+    }
+}
+
+void Set1f(Gl& gl, const Program& p, GLint location, GLfloat v)
+{
+    GLfloat values[1] = {v};
+    if (UniformChanged(p, location, values))
+    {
+        gl.Uniform1f(location, v);
+    }
+}
+
+void Set2f(Gl& gl, const Program& p, GLint location, GLfloat a, GLfloat b)
+{
+    GLfloat values[2] = {a, b};
+    if (UniformChanged(p, location, values))
+    {
+        gl.Uniform2f(location, a, b);
+    }
+}
+
+void Set3f(Gl& gl, const Program& p, GLint location, GLfloat a, GLfloat b, GLfloat c)
+{
+    GLfloat values[3] = {a, b, c};
+    if (UniformChanged(p, location, values))
+    {
+        gl.Uniform3f(location, a, b, c);
+    }
+}
+
+void Set4ui(Gl& gl, const Program& p, GLint location, GLuint a, GLuint b, GLuint c, GLuint d)
+{
+    GLuint values[4] = {a, b, c, d};
+    if (UniformChanged(p, location, values))
+    {
+        gl.Uniform4ui(location, a, b, c, d);
+    }
+}
+
+void Set16i(Gl& gl, const Program& p, GLint location, const GLint (&values)[16])
+{
+    if (UniformChanged(p, location, values))
+    {
+        gl.Uniform1iv(location, 16, values);
+    }
+}
+
+// A scope's time added to a statistic
+struct ScopedNs
+{
+    u64& total;
+    std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    explicit ScopedNs(u64& to) : total(to) {}
+    ~ScopedNs()
+    {
+        total += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+    }
 };
 
 struct CachedTexture
@@ -1210,6 +1310,8 @@ private:
     void Staging(u32 width, u32 height, bool depth, GLuint* texture, GLuint* fbo);
     // Reads back as OpenGL ES allows: the bound R32UI framebuffer's words (ES: RGBA_INTEGER, four a pixel, compacted), and
     // a depth texture's values as floats (ES: drawn into an R32F texture first, as a depth buffer can't be read)
+    GLuint SamplerFor(GLenum minFilter, GLenum magFilter, GLenum wrapS, GLenum wrapT, u32 anisotropy);
+    std::map<std::tuple<GLenum, GLenum, GLenum, GLenum, u32>, GLuint> samplers_;
     void ReadWords(GLint x, GLint y, GLsizei width, GLsizei height, void* to);
     void ReadDepth(GLuint depthTexture, GLsizei width, GLsizei height, void* to);
     std::vector<u32> readScratch_;
@@ -1428,10 +1530,20 @@ HwGs::~HwGs()
 
 void HwGs::MakeCurrent()
 {
+    // Asked for every primitive: once a thread has it current it keeps it (nothing else makes a context current on the
+    // render thread), so the query is made once a thread
+    static thread_local SDL_GLContext current = nullptr;
+    if (current == context_.context && current != nullptr)
+    {
+        return;
+    }
+
     if (!NativeGl::IsCurrent(context_))
     {
         NativeGl::MakeCurrent(context_);
     }
+
+    current = context_.context;
 }
 
 bool HwGs::Init()
@@ -1613,6 +1725,31 @@ void HwGs::Staging(u32 width, u32 height, bool depth, GLuint* texture, GLuint* f
     }
 
     staging_[key] = {*texture, *fbo};
+}
+
+GLuint HwGs::SamplerFor(GLenum minFilter, GLenum magFilter, GLenum wrapS, GLenum wrapT, u32 anisotropy)
+{
+    auto key = std::make_tuple(minFilter, magFilter, wrapS, wrapT, anisotropy);
+    auto found = samplers_.find(key);
+    if (found != samplers_.end())
+    {
+        return found->second;
+    }
+
+    Gl& gl = GetGl();
+    GLuint sampler = 0;
+    gl.GenSamplers(1, &sampler);
+    gl.SamplerParameteri(sampler, GL_TEXTURE_MIN_FILTER, static_cast<GLint>(minFilter));
+    gl.SamplerParameteri(sampler, GL_TEXTURE_MAG_FILTER, static_cast<GLint>(magFilter));
+    gl.SamplerParameteri(sampler, GL_TEXTURE_WRAP_S, static_cast<GLint>(wrapS));
+    gl.SamplerParameteri(sampler, GL_TEXTURE_WRAP_T, static_cast<GLint>(wrapT));
+    if (HasAnisotropy())
+    {
+        gl.SamplerParameterf(sampler, GL_TEXTURE_MAX_ANISOTROPY, static_cast<f32>(anisotropy != 0 ? anisotropy : 1));
+    }
+
+    samplers_[key] = sampler;
+    return sampler;
 }
 
 void HwGs::ReadWords(GLint x, GLint y, GLsizei width, GLsizei height, void* to)
@@ -2109,6 +2246,7 @@ void HwGs::InitMemory()
 
 GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 right, s32 bottom)
 {
+    ScopedNs timed(stats.decodeNs);
     const Gs::RegTex0& tex0 = state.context->tex0;
     const Gs::TextureLevel& base = state.levels[0];
     GpuTexture* entry = nullptr;
@@ -2663,6 +2801,7 @@ void HwGs::UseLayout(GLuint program, u32 psm, u32 bp, u32 bw, u32 pagesDown)
 
 void HwGs::MemFromTarget(Target* target, const Gs::PageSet& pages)
 {
+    ScopedNs timed(stats.memoryNs);
     Gl& gl = GetGl();
     stats.downloads++;
     TraceConversion("from", target, pages);
@@ -2724,6 +2863,7 @@ void HwGs::MemFromTarget(Target* target, const Gs::PageSet& pages)
 
 void HwGs::TargetFromMem(Target* target, const Gs::PageSet& pages)
 {
+    ScopedNs timed(stats.memoryNs);
     Gl& gl = GetGl();
     stats.uploads++;
     TraceConversion("into", target, pages);
@@ -3034,6 +3174,7 @@ void HwGs::SyncCpu(const Gs::PageSet& pages)
 
 void HwGs::ProcessWrites()
 {
+    ScopedNs timed(stats.memoryNs);
     if (!anyWritten_.exchange(false, std::memory_order_acquire))
     {
         return;
@@ -3086,6 +3227,7 @@ void HwGs::BeforeCpuRead(const Gs::PageSet& pages)
 
 void HwGs::Download(Target* target)
 {
+    ScopedNs timed(stats.memoryNs);
     Gs::PageSet pages;
     Gs::PageSet candidates = newestMask_ & target->pages;
     if (candidates.none())
@@ -3208,6 +3350,7 @@ void HwGs::Download(Target* target)
 
 void HwGs::Upload(Target* target, const Gs::PageSet& pages)
 {
+    ScopedNs timed(stats.memoryNs);
     Flush();
     stats.uploads++;
     static const bool counting = std::getenv("TWIN_HW_STATS") != nullptr;
@@ -3727,6 +3870,7 @@ Target* HwGs::ScratchStencil(Target* colour)
 
 bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
 {
+    // (not timed: a clock read for each of a frame's tens of thousands of primitives showed in the profile)
     MakeCurrent();
     ProcessWrites();
     // The colour target's pixels a PS2 pixel (set when it's known)
@@ -3839,7 +3983,11 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
     if (state.date)
     {
         static const bool noStencilDate = std::getenv("TWIN_HW_NO_STENCIL_DATE") != nullptr;
-        if (alphaKept && !noStencilDate)
+        // Without the dual-source blend (Mali's own driver) the shader blends anyway, and one that reads the framebuffer tests
+        // the alpha there: no stencil pass, no copy of the target. With it (ANGLE on Vulkan) GL's blend and the stencil keep
+        // the batches whole, and its framebuffer reads cost a pass each
+        static const bool fetch = !NativeGl::DualSourceBlend() && NativeGl::FramebufferFetch();
+        if (alphaKept && !noStencilDate && !fetch)
         {
             stencilDate = true;
         }
@@ -4751,6 +4899,7 @@ void HwGs::AddPrimitive(const Gs::Gs::DrawState& state, const Gs::Vertex* vertex
 
 void HwGs::Flush()
 {
+    ScopedNs timed(stats.flushNs);
     if (!batching_ || vertexes_.empty())
     {
         batching_ = false;
@@ -4949,14 +5098,9 @@ void HwGs::Flush()
     {
         gl.ActiveTexture(GL_TEXTURE0);
         gl.BindTexture(GL_TEXTURE_2D, k.texture);
-        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, static_cast<GLint>(k.minFilter));
-        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, static_cast<GLint>(k.magFilter));
-        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, static_cast<GLint>(k.wrapS));
-        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, static_cast<GLint>(k.wrapT));
-        if (HasAnisotropy())
-        {
-            gl.TexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, static_cast<f32>(k.anisotropy != 0 ? k.anisotropy : 1));
-        }
+        // The batch's filters and wraps as a sampler object (made once for each combination): one bind in place of five
+        // parameter calls on the texture, which cost a mobile driver a revalidation of it each
+        gl.BindSampler(0, SamplerFor(k.minFilter, k.magFilter, k.wrapS, k.wrapT, k.anisotropy));
     }
 
     gl.BindVertexArray(vertexArray_);
@@ -4975,42 +5119,42 @@ void HwGs::Flush()
         if (smallViewport)
         {
             gl.Viewport(0, 0, width, height);
-            gl.Uniform2f(p.viewSize, static_cast<f32>(width), static_cast<f32>(height));
-            gl.Uniform2f(p.viewOrigin, 0.0f, 0.0f);
+            Set2f(gl, p, p.viewSize, static_cast<f32>(width), static_cast<f32>(height));
+            Set2f(gl, p, p.viewOrigin, 0.0f, 0.0f);
         }
         else
         {
             gl.Viewport(-BigViewOrigin, -BigViewOrigin, BigViewSize, BigViewSize);
-            gl.Uniform2f(p.viewSize, static_cast<f32>(BigViewSize), static_cast<f32>(BigViewSize));
-            gl.Uniform2f(p.viewOrigin, static_cast<f32>(BigViewOrigin), static_cast<f32>(BigViewOrigin));
+            Set2f(gl, p, p.viewSize, static_cast<f32>(BigViewSize), static_cast<f32>(BigViewSize));
+            Set2f(gl, p, p.viewOrigin, static_cast<f32>(BigViewOrigin), static_cast<f32>(BigViewOrigin));
         }
 
-        gl.Uniform1f(p.zMax, k.zMax);
-        gl.Uniform1ui(p.zMaxU, k.zMaxU);
-        gl.Uniform1i(p.depthReverse, static_cast<GLint>(k.depthReverse));
+        Set1f(gl, p, p.zMax, k.zMax);
+        Set1ui(gl, p, p.zMaxU, k.zMaxU);
+        Set1i(gl, p, p.depthReverse, static_cast<GLint>(k.depthReverse));
         if (k.program & BitNativeDepth)
         {
             gl.ActiveTexture(GL_TEXTURE0 + 4);
             gl.BindTexture(GL_TEXTURE_2D, depthCopy);
             gl.ActiveTexture(GL_TEXTURE0);
-            gl.Uniform1i(p.depthCopy, 4);
-            gl.Uniform1i(p.nativeZtst, static_cast<GLint>(k.nativeDepthTest));
-            gl.Uniform1i(p.targetScale, static_cast<GLint>(n));
+            Set1i(gl, p, p.depthCopy, 4);
+            Set1i(gl, p, p.nativeZtst, static_cast<GLint>(k.nativeDepthTest));
+            Set1i(gl, p, p.targetScale, static_cast<GLint>(n));
         }
-        gl.Uniform1f(p.pointSize, static_cast<f32>(n));
-        gl.Uniform1i(p.tex, 0);
-        gl.Uniform2f(p.texSize, k.gsTexWidth, k.gsTexHeight);
-        gl.Uniform2f(p.texActual, k.texWidth, k.texHeight);
-        gl.Uniform1f(p.texSnap, static_cast<f32>(k.texSnap));
-        gl.Uniform1f(p.aref, static_cast<f32>(k.aref));
-        gl.Uniform3f(p.fogColour, static_cast<f32>(k.fogColour & 0xFF), static_cast<f32>((k.fogColour >> 8) & 0xFF),
+        Set1f(gl, p, p.pointSize, static_cast<f32>(n));
+        Set1i(gl, p, p.tex, 0);
+        Set2f(gl, p, p.texSize, k.gsTexWidth, k.gsTexHeight);
+        Set2f(gl, p, p.texActual, k.texWidth, k.texHeight);
+        Set1f(gl, p, p.texSnap, static_cast<f32>(k.texSnap));
+        Set1f(gl, p, p.aref, static_cast<f32>(k.aref));
+        Set3f(gl, p, p.fogColour, static_cast<f32>(k.fogColour & 0xFF), static_cast<f32>((k.fogColour >> 8) & 0xFF),
                      static_cast<f32>((k.fogColour >> 16) & 0xFF));
-        gl.Uniform1f(p.ta0, static_cast<f32>(k.ta0));
-        gl.Uniform1f(p.ta1, static_cast<f32>(k.ta1));
-        gl.Uniform1i(p.aem, static_cast<GLint>(k.aem));
-        gl.Uniform1f(p.lodK, k.lodK);
-        gl.Uniform1f(p.lodL, std::exp2(static_cast<f32>(k.lodL)));
-        gl.Uniform1f(p.lodMax, static_cast<f32>(k.mxl));
+        Set1f(gl, p, p.ta0, static_cast<f32>(k.ta0));
+        Set1f(gl, p, p.ta1, static_cast<f32>(k.ta1));
+        Set1i(gl, p, p.aem, static_cast<GLint>(k.aem));
+        Set1f(gl, p, p.lodK, k.lodK);
+        Set1f(gl, p, p.lodL, std::exp2(static_cast<f32>(k.lodL)));
+        Set1f(gl, p, p.lodMax, static_cast<f32>(k.mxl));
         GLint dimx[16];
         for (u32 i = 0; i < 16; i++)
         {
@@ -5018,15 +5162,15 @@ void HwGs::Flush()
             dimx[i] = value & 4 ? value - 8 : value;
         }
 
-        gl.Uniform1iv(p.dimx, 16, dimx);
-        gl.Uniform1f(p.scale, static_cast<f32>(k.ditherScale != 0 ? k.ditherScale : 1));
-        gl.Uniform1i(p.colclamp, static_cast<GLint>(k.colclamp));
+        Set16i(gl, p, p.dimx, dimx);
+        Set1f(gl, p, p.scale, static_cast<f32>(k.ditherScale != 0 ? k.ditherScale : 1));
+        Set1i(gl, p, p.colclamp, static_cast<GLint>(k.colclamp));
         if (k.program & BitWrapAdd)
         {
-            gl.Uniform1i(p.blendA, static_cast<GLint>(k.gsBlend[0]));
-            gl.Uniform1i(p.blendB, static_cast<GLint>(k.gsBlend[1]));
-            gl.Uniform1i(p.blendC, static_cast<GLint>(k.gsBlend[2]));
-            gl.Uniform1f(p.blendFix, static_cast<f32>(k.gsFix));
+            Set1i(gl, p, p.blendA, static_cast<GLint>(k.gsBlend[0]));
+            Set1i(gl, p, p.blendB, static_cast<GLint>(k.gsBlend[1]));
+            Set1i(gl, p, p.blendC, static_cast<GLint>(k.gsBlend[2]));
+            Set1f(gl, p, p.blendFix, static_cast<f32>(k.gsFix));
         }
 
         if (k.program & BitShaderBlend)
@@ -5036,18 +5180,18 @@ void HwGs::Flush()
                 gl.ActiveTexture(GL_TEXTURE0 + 1);
                 gl.BindTexture(GL_TEXTURE_2D, destination);
                 gl.ActiveTexture(GL_TEXTURE0);
-                gl.Uniform1i(p.destination, 1);
+                Set1i(gl, p, p.destination, 1);
             }
             bool blending = k.gsBlend[0] != 0 || k.gsBlend[1] != 0 || k.gsBlend[2] != 0 || k.gsBlend[3] != 0 || k.gsFix != 0;
-            gl.Uniform1i(p.blendOn, blending ? 1 : 0);
-            gl.Uniform1i(p.blendA, static_cast<GLint>(k.gsBlend[0]));
-            gl.Uniform1i(p.blendB, static_cast<GLint>(k.gsBlend[1]));
-            gl.Uniform1i(p.blendC, static_cast<GLint>(k.gsBlend[2]));
-            gl.Uniform1i(p.blendD, static_cast<GLint>(k.gsBlend[3]));
-            gl.Uniform1f(p.blendFix, static_cast<f32>(k.gsFix));
-            gl.Uniform1i(p.pabe, static_cast<GLint>(k.pabe));
-            gl.Uniform1i(p.datm, static_cast<GLint>(k.datm));
-            gl.Uniform4ui(p.frameMask, k.frameMask[0], k.frameMask[1], k.frameMask[2], k.frameMask[3]);
+            Set1i(gl, p, p.blendOn, blending ? 1 : 0);
+            Set1i(gl, p, p.blendA, static_cast<GLint>(k.gsBlend[0]));
+            Set1i(gl, p, p.blendB, static_cast<GLint>(k.gsBlend[1]));
+            Set1i(gl, p, p.blendC, static_cast<GLint>(k.gsBlend[2]));
+            Set1i(gl, p, p.blendD, static_cast<GLint>(k.gsBlend[3]));
+            Set1f(gl, p, p.blendFix, static_cast<f32>(k.gsFix));
+            Set1i(gl, p, p.pabe, static_cast<GLint>(k.pabe));
+            Set1i(gl, p, p.datm, static_cast<GLint>(k.datm));
+            Set4ui(gl, p, p.frameMask, k.frameMask[0], k.frameMask[1], k.frameMask[2], k.frameMask[3]);
         }
         u32 mask = k.colourMask;
         gl.ColorMask(colourOn && (mask & 1) ? GL_TRUE : GL_FALSE, colourOn && (mask & 2) ? GL_TRUE : GL_FALSE,
@@ -5104,6 +5248,7 @@ void HwGs::Flush()
         }
     }
 
+    gl.BindSampler(0, 0);
     gl.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     gl.DepthMask(GL_TRUE);
     gl.Disable(GL_STENCIL_TEST);

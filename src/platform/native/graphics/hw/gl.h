@@ -64,6 +64,11 @@ struct Gl
     void (*DrawBuffer)(GLenum);
     void (*DrawBuffers)(GLsizei, const GLenum*);
     void (*GetIntegerv)(GLenum, GLint*);
+    // Sampler objects (GL 3.3, ES 3.0): a batch's filters and wraps bound in one call rather than set on the texture
+    void (*GenSamplers)(GLsizei, GLuint*);
+    void (*BindSampler)(GLuint, GLuint);
+    void (*SamplerParameteri)(GLuint, GLenum, GLint);
+    void (*SamplerParameterf)(GLuint, GLenum, GLfloat);
     void (*Viewport)(GLint, GLint, GLsizei, GLsizei);
     void (*Scissor)(GLint, GLint, GLsizei, GLsizei);
     void (*Enable)(GLenum);

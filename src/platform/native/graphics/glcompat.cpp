@@ -136,18 +136,13 @@ bool DualSourceBlend()
         return true;
     }
 
-    // Asked once per context in practice (the renderer's start): kept by the context's address
-    static thread_local SDL_GLContext askedOn = nullptr;
-    static thread_local bool answer = false;
-    SDL_GLContext current = SDL_GL_GetCurrentContext();
-    if (askedOn != current || current == nullptr)
+    // Asked once (the renderer's start, a context current): the GPU's extensions are the same for every context
+    static const bool answer = []
     {
-        askedOn = current;
         // ($TWIN_GLES_NO_DUAL=1: as a GPU without it, to test the shader blend's path)
         const char* forced = std::getenv("TWIN_GLES_NO_DUAL");
-        answer = (forced == nullptr || forced[0] == '0') && HasExtension("GL_EXT_blend_func_extended");
-    }
-
+        return (forced == nullptr || forced[0] == '0') && HasExtension("GL_EXT_blend_func_extended");
+    }();
     return answer;
 }
 
@@ -158,16 +153,11 @@ bool FramebufferFetch()
         return false;
     }
 
-    static thread_local SDL_GLContext askedOn = nullptr;
-    static thread_local bool answer = false;
-    SDL_GLContext current = SDL_GL_GetCurrentContext();
-    if (askedOn != current || current == nullptr)
+    static const bool answer = []
     {
-        askedOn = current;
         const char* forced = std::getenv("TWIN_GLES_NO_FETCH");
-        answer = (forced == nullptr || forced[0] == '0') && HasExtension("GL_EXT_shader_framebuffer_fetch");
-    }
-
+        return (forced == nullptr || forced[0] == '0') && HasExtension("GL_EXT_shader_framebuffer_fetch");
+    }();
     return answer;
 }
 

@@ -22,7 +22,8 @@ if(ANDROID)
     # The NDK's toolchain puts -g in every build's flags: line tables only, as above (with full debug info the callers of
     # pools.h's explicit specializations lose their asm labels and bind to stand-ins)
     string(REPLACE "-g " "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -gline-tables-only")
+    # Frame pointers kept, for the sampling profiler's stack walks (profiler_posix.cpp)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -gline-tables-only -fno-omit-frame-pointer")
     set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 endif()
 

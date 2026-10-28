@@ -471,6 +471,106 @@ void Native::OpenDiscImage()
     Log("disc image %s", image.c_str());
 }
 
+// ---------------------------------------------------------------------------------------------------------- the threads
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+void Native::PinToFastCores(const char* name)
+{
+    RegisterProfiledThread(name);
+#if defined(__linux__)
+    // The cores by their top frequency: those within 10% of the fastest are the big ones (one or two tiers on a phone)
+    static std::vector<int> fast = []
+    {
+        std::vector<std::pair<int, long>> cores;
+        for (int cpu = 0; cpu < 64; cpu++)
+        {
+            std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpufreq/cpuinfo_max_freq");
+            long frequency = 0;
+            if (!(file >> frequency))
+            {
+                if (cpu > 0)
+                {
+                    break;
+                }
+
+                continue;
+            }
+
+            cores.emplace_back(cpu, frequency);
+        }
+
+        long top = 0;
+        for (const auto& core : cores)
+        {
+            top = std::max(top, core.second);
+        }
+
+        std::vector<int> chosen;
+        for (const auto& core : cores)
+        {
+            if (core.second * 10 >= top * 9)
+            {
+                chosen.push_back(core.first);
+            }
+        }
+
+        // One big core only: the next tier joins it, so the three threads don't share one core
+        if (chosen.size() < 3)
+        {
+            long second = 0;
+            for (const auto& core : cores)
+            {
+                if (core.second * 10 < top * 9)
+                {
+                    second = std::max(second, core.second);
+                }
+            }
+
+            for (const auto& core : cores)
+            {
+                if (core.second * 10 < top * 9 && core.second * 10 >= second * 9)
+                {
+                    chosen.push_back(core.first);
+                }
+            }
+        }
+
+        return chosen;
+    }();
+
+    if (fast.empty())
+    {
+        return;
+    }
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int cpu : fast)
+    {
+        CPU_SET(cpu, &set);
+    }
+
+    pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+    bool pinned = sched_setaffinity(tid, sizeof(set), &set) == 0;
+    // A higher priority (Android lets an app raise its threads this far; elsewhere it may refuse)
+    bool raised = setpriority(PRIO_PROCESS, static_cast<id_t>(tid), -10) == 0;
+    std::string list;
+    for (int cpu : fast)
+    {
+        list += (list.empty() ? "" : ",") + std::to_string(cpu);
+    }
+
+    Log("threads: %s on cores %s%s%s", name, list.c_str(), pinned ? "" : " (the affinity was refused)", raised ? ", priority raised" : "");
+#else
+    (void)name;
+#endif
+}
+
 // ---------------------------------------------------------------------------------------------------------- the system
 void Platform::System::Initialise()
 {

@@ -74,6 +74,12 @@ struct HardwareStats
     u64 decodes;
     u64 contentHits;
     const char* lastFallback;
+    // The render thread's time (nanoseconds) in the batches' flushes (the draws), the textures' decodes, memory's passes
+    // (uploads, downloads, the conversions) and the primitives' preparation (Draw)
+    u64 flushNs;
+    u64 decodeNs;
+    u64 memoryNs;
+    u64 drawNs;
 };
 HardwareStats GetHardwareStats();
 }

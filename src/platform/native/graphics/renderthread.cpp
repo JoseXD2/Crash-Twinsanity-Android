@@ -1,4 +1,5 @@
 #include "renderthread.h"
+#include "native.h"
 
 #include "hardware.h"
 #include "ee/gif.h"
@@ -387,10 +388,12 @@ void RenderThread::Run()
     if (next_ != nullptr)
     {
         t_OnVuThread = true;
+        Native::PinToFastCores("VU1's thread");
     }
     else
     {
         t_OnRenderThread = true;
+        Native::PinToFastCores("the render thread");
         UseRenderContext();
     }
 
