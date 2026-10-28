@@ -130,6 +130,12 @@ struct Gl
     GLsync (*FenceSync)(GLenum, GLbitfield);
     void (*WaitSync)(GLsync, GLbitfield, GLuint64);
     void (*DeleteSync)(GLsync);
+    // GPU timing of the passes (TWIN_HW_STATS: GL_TIME_ELAPSED, on OpenGL ES by GL_EXT_disjoint_timer_query); null without them
+    void (*GenQueries)(GLsizei, GLuint*);
+    void (*BeginQuery)(GLenum, GLuint);
+    void (*EndQuery)(GLenum);
+    void (*GetQueryObjectuiv)(GLuint, GLenum, GLuint*);
+    void (*GetQueryObjectui64v)(GLuint, GLenum, GLuint64*);
 };
 
 // The entry points (loaded the first time, with a context current); false when one is missing

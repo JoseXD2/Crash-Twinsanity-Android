@@ -6,6 +6,7 @@
 // drawn in the game's style (buttonart.cpp)
 #include "ui/bindings.h"
 #include "ui/overlayinternal.h"
+#include "ui/touch.h"
 
 #include "native.h"
 
@@ -462,7 +463,12 @@ void NoteInputDevice(bool keyboard, SDL_Gamepad* gamepad, SDL_Gamepad* connected
         g_PadStyleKnown = true;
     }
 
-    if (!forced)
+    if (!forced && TouchControlsEnabled() && gamepad == nullptr)
+    {
+        // The touch controls are a PlayStation pad (their art): their prompts, not the keyboard's, until a pad is used
+        style = PromptPlayStation;
+    }
+    else if (!forced)
     {
         if (gamepad != nullptr && !keyboard)
         {

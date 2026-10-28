@@ -207,13 +207,15 @@ void Build()
         },
         1, [](s32 value) { return Text(value != 0 ? TextFullscreen : TextWindowed); });
     mode.asksToKeep = true;
+    // (A phone's window is its screen: no display mode, window size or screen position to choose)
+    mode.shown = [] { return !Native::IsMobile(); };
     display.push_back(mode);
     Row size = Choice(
         TextWindowSize, TextDescWindowSize, [] { return WindowSizeChoice(); },
         [](s32 value) { SetResolution(FromChoices(ScaleChoice(CurrentResolution()), value)); }, DisplayChoices - 2,
         [](s32 value) { return Text(TextWindow960 + static_cast<u32>(value)); });
     size.asksToKeep = true;
-    size.shown = [] { return !CurrentResolution().fullscreen; };
+    size.shown = [] { return !Native::IsMobile() && !CurrentResolution().fullscreen; };
     display.push_back(size);
     display.push_back(Choice(
         TextResolution, TextDescResolution, [] { return ScaleChoice(CurrentResolution()); },
@@ -249,7 +251,9 @@ void Build()
     display.push_back(OptionChoice(TextAntiAliasing, TextDescAntiAliasing, OptionAntiAliasing, {0, TextFxaa}));
     display.push_back(Toggle(TextVSync, TextDescVSync, OptionVSync));
     display.push_back(Toggle(TextShowFps, TextDescShowFps, OptionShowFps));
-    display.push_back(Action(GameTextCentreScreen, TextDescScreenPosition, [] { OpenScreenPosition(); }));
+    Row centre = Action(GameTextCentreScreen, TextDescScreenPosition, [] { OpenScreenPosition(); });
+    centre.shown = [] { return !Native::IsMobile(); };
+    display.push_back(centre);
 
     std::vector<Row>& audio = g_Rows[TabAudio];
     audio.push_back(Slider(GameTextMusicVolume, TextDescMusic, [] { return GroupLevel(MusicGroup); }, SetMusic));
@@ -457,6 +461,8 @@ bool WatchSettings(void*, SDL_Event* event)
 
             break;
         case SDL_SCANCODE_ESCAPE:
+        // (Android's back gesture or button)
+        case SDL_SCANCODE_AC_BACK:
             if (!event->key.repeat)
             {
                 Act(UiBack);

@@ -393,7 +393,7 @@ void RenderThread::Run()
     else
     {
         t_OnRenderThread = true;
-        Native::PinToFastCores("the render thread");
+        Native::PinToFastCores("the render thread", true);
         UseRenderContext();
     }
 

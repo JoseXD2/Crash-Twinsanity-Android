@@ -103,7 +103,9 @@ double SessionSeconds();
 // The calling thread kept to the machine's fastest cores and given a high priority (Android and Linux: by the cores' top
 // frequencies; elsewhere nothing). The game's, VU1's and the render thread: a phone's scheduler otherwise leaves them on its
 // small cores
-void PinToFastCores(const char* name);
+void PinToFastCores(const char* name, bool busiest = false);
+// Whether this is a phone or tablet (Android): the window is the screen, the controls are touched
+bool IsMobile();
 // The sampling profiler (profiler_posix.cpp, $TWIN_PROFILE): the threads it samples register themselves (PinToFastCores does)
 void RegisterProfiledThread(const char* name);
 void StartProfiler();

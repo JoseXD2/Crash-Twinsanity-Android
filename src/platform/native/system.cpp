@@ -14,6 +14,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -479,11 +480,21 @@ void Native::OpenDiscImage()
 #include <unistd.h>
 #endif
 
-void Native::PinToFastCores(const char* name)
+bool Native::IsMobile()
+{
+#if defined(__ANDROID__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+void Native::PinToFastCores(const char* name, bool busiest)
 {
     RegisterProfiledThread(name);
 #if defined(__linux__)
-    // The cores by their top frequency: those within 10% of the fastest are the big ones (one or two tiers on a phone)
+    // The cores by their top frequency: those within 10% of the fastest are the big ones (one or two tiers on a phone), the
+    // very fastest first
     static std::vector<int> fast = []
     {
         std::vector<std::pair<int, long>> cores;
@@ -540,6 +551,19 @@ void Native::PinToFastCores(const char* name)
             }
         }
 
+        auto frequencyOf = [&](int cpu)
+        {
+            for (const auto& core : cores)
+            {
+                if (core.first == cpu)
+                {
+                    return core.second;
+                }
+            }
+
+            return 0l;
+        };
+        std::stable_sort(chosen.begin(), chosen.end(), [&](int a, int b) { return frequencyOf(a) > frequencyOf(b); });
         return chosen;
     }();
 
@@ -548,9 +572,17 @@ void Native::PinToFastCores(const char* name)
         return;
     }
 
+    // The busiest thread (the render thread) has the fastest core to itself where there are cores enough for that (a phone's
+    // prime core); the others share the rest of the big ones
+    std::vector<int> mine = fast;
+    if (fast.size() >= 3)
+    {
+        mine = busiest ? std::vector<int>{fast[0]} : std::vector<int>(fast.begin() + 1, fast.end());
+    }
+
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (int cpu : fast)
+    for (int cpu : mine)
     {
         CPU_SET(cpu, &set);
     }
@@ -560,7 +592,7 @@ void Native::PinToFastCores(const char* name)
     // A higher priority (Android lets an app raise its threads this far; elsewhere it may refuse)
     bool raised = setpriority(PRIO_PROCESS, static_cast<id_t>(tid), -10) == 0;
     std::string list;
-    for (int cpu : fast)
+    for (int cpu : mine)
     {
         list += (list.empty() ? "" : ",") + std::to_string(cpu);
     }

@@ -218,6 +218,10 @@ struct Target
     // Each page's pixels (y << 11 | x) and their bounding rectangle
     std::vector<std::vector<u32>> pixels;
     std::vector<Rect> rects;
+    // Pages whose load was put off (HwGs::DeferLoad): the batch's sprites overwrite them whole, perhaps (the game clears and
+    // copies its buffers in strips), and each page's 8 x 8 blocks they've covered so far (a page's blocks in a 64 bit mask)
+    Gs::PageSet deferred;
+    std::vector<u64> covered;
 };
 
 struct HwVertex
@@ -1109,15 +1113,20 @@ void Set16i(Gl& gl, const Program& p, GLint location, const GLint (&values)[16])
     }
 }
 
-// A scope's time added to a statistic
+// A scope's time added to a statistic, less the time of the timed scopes inside it (a decode flushes a batch and loads
+// memory's copy: each counted once, where it ran), so the statistics add up to the time spent
 struct ScopedNs
 {
+    static inline thread_local u64 t_Inner = 0;
     u64& total;
+    u64 outer;
     std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
-    explicit ScopedNs(u64& to) : total(to) {}
+    explicit ScopedNs(u64& to) : total(to), outer(t_Inner) { t_Inner = 0; }
     ~ScopedNs()
     {
-        total += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+        const u64 elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+        total += elapsed - std::min(elapsed, t_Inner);
+        t_Inner = outer + elapsed;
     }
 };
 
@@ -1271,6 +1280,11 @@ public:
     // A primitive drawn as the one before it was (its state, targets and texture as they were: HwGs::DrawLikeLast), and the
     // end of every primitive's drawing (its batch, its vertexes, the pages it draws)
     bool DrawLikeLast(const Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count, Rect rect);
+    bool PageRows(const Target* target, const Rect& rect, s32 rows[4]) const;
+    void ResolveDeferred();
+    u64 FullCoverage(const Target* target) const;
+    bool CanDefer(const Gs::Gs::DrawState& state, bool wrapAdd, const u32 channelMasks[4]) const;
+    bool DeferLoad(Target* target, const Rect& rect, const Gs::PageSet& pages);
     void AddPrimitive(const Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, const Rect& rect, Target* colour, Target* depth,
                       s32 n, bool shaderBlend, const Gs::PageSet& drawnPages, const Gs::PageSet& depthPages);
     void BeforeCpuRead(const Gs::PageSet& pages) override;
@@ -1371,6 +1385,15 @@ private:
         const GpuTexture* texture = nullptr;
         GLuint textureId = 0;
         bool shaderBlend = false;
+        // The pages the previous primitive drew (its rectangle's rows and columns of pages in each target): the next
+        // primitive in the same pages needs no working out, loading or marking of them (a mesh's triangles, mostly in a page)
+        bool pagesKnown = false;
+        // Whether its load was put off (DeferLoad): the next sprite like it adds its coverage
+        bool defers = false;
+        s32 colourRows[4] = {};
+        s32 depthRows[4] = {};
+        Gs::PageSet drawnPages;
+        Gs::PageSet depthPages;
     } last_;
     // Counts the targets made and destroyed
     u64 targetsVersion_ = 0;
@@ -1451,15 +1474,96 @@ private:
         std::fprintf(stderr, "\n");
     }
 
+    // The primitive being drawn (Draw), for the statistics' details
+    const Gs::Gs::DrawState* drawing_ = nullptr;
+    Rect drawingRect_ = {};
+    std::string DescribeDraw(const Gs::Gs::DrawState& d) const
+    {
+        char text[160];
+        std::snprintf(text, sizeof(text), "prim %u rect %d,%d-%d,%d scissor %d,%d-%d,%d tex %u blend %u atst %u/%u date %u ztst %u zw %u fbmsk %x",
+                      d.type, drawingRect_.left, drawingRect_.top, drawingRect_.right, drawingRect_.bottom, d.scissorLeft, d.scissorTop,
+                      d.scissorRight, d.scissorBottom, d.textured ? 1 : 0, d.blend ? 1 : 0, d.alphaTest ? 1 : 0, d.atst, d.date ? 1 : 0,
+                      d.ztst, d.zWritten ? 1 : 0, d.fbmsk);
+        return text;
+    }
     void Pass(u64 identity, const char* cause)
     {
         static const bool counting = std::getenv("TWIN_HW_STATS") != nullptr;
         if (counting && identity != passIdentity_)
         {
             passCounts_[cause]++;
+            TimePass(cause);
         }
 
         passIdentity_ = identity;
+    }
+    // The GPU's time in each pass (TWIN_HW_STATS, with the timer queries): a query begun as a pass starts and ended as the next
+    // does, its result read a second later with the pass counts (never waited for: a late one is left out)
+    static constexpr u32 QueryRing = 8192;
+    GLuint queries_[QueryRing] = {};
+    const char* queryCauses_[QueryRing] = {};
+    u32 queryNext_ = 0;
+    u32 queryReported_ = 0;
+    bool queryOpen_ = false;
+    void TimePass(const char* cause)
+    {
+        Gl& gl = GetGl();
+        if (gl.GenQueries == nullptr)
+        {
+            return;
+        }
+
+        if (queries_[0] == 0)
+        {
+            gl.GenQueries(QueryRing, queries_);
+        }
+
+        if (queryOpen_)
+        {
+            gl.EndQuery(0x88BF);
+            queryOpen_ = false;
+        }
+
+        // (A full ring: the rest of the second's passes go untimed)
+        if (queryNext_ - queryReported_ >= QueryRing)
+        {
+            return;
+        }
+
+        gl.BeginQuery(0x88BF, queries_[queryNext_ % QueryRing]);
+        queryCauses_[queryNext_ % QueryRing] = cause;
+        queryNext_++;
+        queryOpen_ = true;
+    }
+    void ReportPassTimes(std::map<std::string, u64>& nanoseconds, u32* late)
+    {
+        Gl& gl = GetGl();
+        if (gl.GenQueries == nullptr)
+        {
+            return;
+        }
+
+        if (queryOpen_)
+        {
+            gl.EndQuery(0x88BF);
+            queryOpen_ = false;
+        }
+
+        for (; queryReported_ < queryNext_; queryReported_++)
+        {
+            const u32 index = queryReported_ % QueryRing;
+            GLuint available = 0;
+            gl.GetQueryObjectuiv(queries_[index], 0x8867, &available);
+            if (!available)
+            {
+                (*late)++;
+                continue;
+            }
+
+            GLuint64 time = 0;
+            gl.GetQueryObjectui64v(queries_[index], 0x8866, &time);
+            nanoseconds[queryCauses_[index]] += time;
+        }
     }
     GLuint clutTexture_ = 0;
     u32 clutUploaded_ = 0;
@@ -1496,6 +1600,8 @@ private:
     // The context drawn with: the render thread's, the presenter's, or one of its own (no window: the tests')
     NativeGl::Context context_;
     bool ownContext_ = false;
+    // The thread the context was last made current on (nothing else makes a context current there)
+    SDL_ThreadID currentThread_ = 0;
     // The shown picture's copies for the render thread's hand-over
     struct ShownCopy
     {
@@ -1532,8 +1638,8 @@ void HwGs::MakeCurrent()
 {
     // Asked for every primitive: once a thread has it current it keeps it (nothing else makes a context current on the
     // render thread), so the query is made once a thread
-    static thread_local SDL_GLContext current = nullptr;
-    if (current == context_.context && current != nullptr)
+    const SDL_ThreadID self = SDL_GetCurrentThreadID();
+    if (currentThread_ == self && context_.context != nullptr)
     {
         return;
     }
@@ -1543,7 +1649,7 @@ void HwGs::MakeCurrent()
         NativeGl::MakeCurrent(context_);
     }
 
-    current = context_.context;
+    currentThread_ = self;
 }
 
 bool HwGs::Init()
@@ -2246,7 +2352,7 @@ void HwGs::InitMemory()
 
 GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 right, s32 bottom)
 {
-    ScopedNs timed(stats.decodeNs);
+    // (timed where it decodes: it's asked for every textured primitive)
     const Gs::RegTex0& tex0 = state.context->tex0;
     const Gs::TextureLevel& base = state.levels[0];
     GpuTexture* entry = nullptr;
@@ -2466,6 +2572,7 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
         ContentTexture& c = contents_[hash];
         if (c.id == 0)
         {
+            ScopedNs timed(stats.decodeNs);
             Flush();
             SyncMem(t.pages);
             c.id = MakeLevels(state);
@@ -2522,6 +2629,7 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
     if (anyStale)
     {
         // The pages current in memory's copy, then the stale tiles' rectangles decoded from it into the texture's own
+        ScopedNs timed(stats.decodeNs);
         Flush();
         SyncMem(needed);
         DecodePasses(state, t.id, stale, t.levelCount);
@@ -2872,10 +2980,12 @@ void HwGs::TargetFromMem(Target* target, const Gs::PageSet& pages)
     {
         static std::map<std::string, u64> counts;
         static u64 total = 0;
-        char detail[128];
-        // Who held the pages newest before (the last target drawn into them)
-        std::snprintf(detail, sizeof(detail), "into %x/%u class %u: %zu pages (%s)", target->bp, target->bw, target->cls, (pages & target->pages).count(),
-                      cpuReason);
+        char detail[256];
+        // Who held the pages newest before (the last target drawn into them), and the primitive that asked (what a clear
+        // of the buffer looks like, if it is one)
+        const Gs::Gs::DrawState* d = drawing_;
+        std::snprintf(detail, sizeof(detail), "into %x/%u class %u: %zu pages (%s) by %s", target->bp, target->bw, target->cls,
+                      (pages & target->pages).count(), cpuReason, d == nullptr ? "-" : DescribeDraw(*d).c_str());
         counts[detail]++;
         if (++total % 400 == 0)
         {
@@ -3175,7 +3285,7 @@ void HwGs::SyncCpu(const Gs::PageSet& pages)
 void HwGs::ProcessWrites()
 {
     // (not timed: called for every primitive, and a clock read each showed in the profile)
-    if (!anyWritten_.exchange(false, std::memory_order_acquire))
+    if (!anyWritten_.load(std::memory_order_relaxed) || !anyWritten_.exchange(false, std::memory_order_acquire))
     {
         return;
     }
@@ -3208,6 +3318,7 @@ void HwGs::ProcessWrites()
         return;
     }
 
+    last_.pagesKnown = false;
     newestMask_ &= ~written;
     memStale_ |= written;
     scaledPages_ &= ~written;
@@ -3536,6 +3647,12 @@ void HwGs::Upload(Target* target, const Gs::PageSet& pages)
 
 void HwGs::EnsureValid(Target* target, const Gs::PageSet& pages)
 {
+    // Pages whose load the batch put off: the batch's flush settles them (loaded or covered) before anything else is loaded
+    if ((pages & target->deferred).any())
+    {
+        Flush();
+    }
+
     Gs::PageSet missing = pages & target->pages & ~target->valid;
     if (missing.none())
     {
@@ -3549,7 +3666,7 @@ void HwGs::EnsureValid(Target* target, const Gs::PageSet& pages)
     if (!narrow)
     {
         ProcessWrites();
-        const Gs::PageSet wanted = target->pages & ~target->valid;
+        const Gs::PageSet wanted = target->pages & ~target->valid & ~target->deferred;
         Gs::PageSet fromTargets = missing & newestMask_;
         if (fromTargets.any())
         {
@@ -3914,6 +4031,13 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
         return true;
     }
 
+    drawing_ = &state;
+    drawingRect_ = rect;
+    struct Forgetting
+    {
+        const Gs::Gs::DrawState*& at;
+        ~Forgetting() { at = nullptr; }
+    } forgetting{drawing_};
     // A mesh's next triangle: drawn as the last was
     if (DrawLikeLast(state, vertexes, count, rect))
     {
@@ -3923,6 +4047,7 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
     // Else made the whole way (and the next drawn the same way if this one can be: not a glyph, a texture from a target or the
     // CPU's decode, or one read from upscaled pages)
     last_.valid = false;
+    last_.pagesKnown = false;
     bool repeatable = true;
 
     // What the GPU can't draw exactly is the software GS's
@@ -4520,17 +4645,28 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
         }
     }
 
-    // The targets current for the pages the primitive draws in
+    // The targets current for the pages the primitive draws in. A sprite that overwrites whole pixels (a clear or a copy of a
+    // buffer, drawn in strips by the game) puts off the load of pages that aren't current: covered whole by the batch's
+    // sprites they're never loaded, else they're loaded before the batch is drawn (ResolveDeferred)
+    // (the deferring is after the batch key's flush below: the pages belong to this sprite's batch)
+    const bool defers = CanDefer(state, wrapAdd, channelMasks);
     Gs::PageSet drawnPages;
     RectPages(colour, rect, drawnPages);
     cpuReason = "frame";
-    EnsureValid(colour, drawnPages);
+    if (!(defers && state.frameWritten))
+    {
+        EnsureValid(colour, drawnPages);
+    }
+
     Gs::PageSet depthPages;
     if (depth != nullptr)
     {
         RectPages(depth, rect, depthPages);
         cpuReason = "depth";
-        EnsureValid(depth, depthPages);
+        if (!(defers && state.zWritten))
+        {
+            EnsureValid(depth, depthPages);
+        }
     }
 
     // The rest of the key
@@ -4654,6 +4790,26 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
         __builtin_memcpy_inline(&key_, &key, sizeof(key));
     }
 
+    // A sprite that overwrites whole pixels puts off the load of the pages it draws that aren't current: covered whole by
+    // the batch's sprites they're never loaded, else they're loaded before the batch is drawn (ResolveDeferred)
+    if (defers)
+    {
+        cpuReason = "frame";
+        if (state.frameWritten && !DeferLoad(colour, rect, drawnPages))
+        {
+            EnsureValid(colour, drawnPages);
+        }
+
+        if (depth != nullptr)
+        {
+            cpuReason = "depth";
+            if (state.zWritten && !DeferLoad(depth, rect, depthPages))
+            {
+                EnsureValid(depth, depthPages);
+            }
+        }
+    }
+
     AddPrimitive(state, vertexes, rect, colour, depth, n, shaderBlend, drawnPages, depthPages);
     if (repeatable && tracePrim == nullptr)
     {
@@ -4668,6 +4824,7 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
         last_.texture = state.textured ? lastTexture_ : nullptr;
         last_.textureId = texture;
         last_.shaderBlend = shaderBlend;
+        last_.defers = defers;
     }
 
     return true;
@@ -4718,26 +4875,90 @@ bool HwGs::DrawLikeLast(const Gs::Gs::DrawState& state, const Gs::Vertex* vertex
         return true;
     }
 
+    // The same pages of both targets as the previous primitive: as valid and as marked as it left them
+    s32 colourRows[4];
+    s32 depthRows[4] = {};
+    const bool rowsKnown = PageRows(colour, rect, colourRows) && (depth == nullptr || PageRows(depth, rect, depthRows));
+    if (rowsKnown && last.pagesKnown && std::memcmp(colourRows, last.colourRows, sizeof(colourRows)) == 0 &&
+        std::memcmp(depthRows, last.depthRows, sizeof(depthRows)) == 0)
+    {
+        if (last.defers)
+        {
+            // (the same pages, more of them covered)
+            if (state.frameWritten)
+            {
+                DeferLoad(colour, rect, last.drawnPages);
+            }
+
+            if (depth != nullptr && state.zWritten)
+            {
+                DeferLoad(depth, rect, last.depthPages);
+            }
+        }
+
+        AddPrimitive(state, vertexes, rect, colour, depth, n, last.shaderBlend, last.drawnPages, last.depthPages);
+        return true;
+    }
+
     Gs::PageSet drawnPages;
     RectPages(colour, rect, drawnPages);
     cpuReason = "frame";
-    EnsureValid(colour, drawnPages);
+    if (!(last.defers && state.frameWritten && DeferLoad(colour, rect, drawnPages)))
+    {
+        EnsureValid(colour, drawnPages);
+    }
+
     Gs::PageSet depthPages;
     if (depth != nullptr)
     {
         RectPages(depth, rect, depthPages);
         cpuReason = "depth";
-        EnsureValid(depth, depthPages);
+        if (!(last.defers && state.zWritten && DeferLoad(depth, rect, depthPages)))
+        {
+            EnsureValid(depth, depthPages);
+        }
     }
 
     AddPrimitive(state, vertexes, rect, colour, depth, n, last.shaderBlend, drawnPages, depthPages);
+    // (not when the two targets share a page: each one's drawing invalidates the other's copy of it)
+    last_.pagesKnown = rowsKnown && (drawnPages & depthPages).none();
+    if (last_.pagesKnown)
+    {
+        std::memcpy(last_.colourRows, colourRows, sizeof(colourRows));
+        std::memcpy(last_.depthRows, depthRows, sizeof(depthRows));
+        last_.drawnPages = drawnPages;
+        last_.depthPages = depthPages;
+    }
+
+    return true;
+}
+
+// The rows and columns of pages a rectangle of an aligned target covers (false for a target whose pages PagesOfRect works out)
+bool HwGs::PageRows(const Target* target, const Rect& rect, s32 rows[4]) const
+{
+    if (!target->aligned)
+    {
+        return false;
+    }
+
+    s32 pageWidth = 0;
+    s32 pageHeight = 0;
+    PageSize(target->psm, &pageWidth, &pageHeight);
+    rows[0] = rect.top / pageHeight;
+    rows[1] = rect.bottom / pageHeight;
+    rows[2] = rect.left / pageWidth;
+    rows[3] = rect.right / pageWidth;
     return true;
 }
 
 void HwGs::AddPrimitive(const Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, const Rect& rect, Target* colour, Target* depth,
                         s32 n, bool shaderBlend, const Gs::PageSet& drawnPages, const Gs::PageSet& depthPages)
 {
-    if (batching_ && shaderBlend)
+    // The shader's blend reads a copy of the destination from before the batch: a primitive over an earlier one of the batch
+    // would read what was there before that one, so the batch ends first. Where the shader reads the framebuffer itself
+    // (the fetch) it sees the earlier one's pixels, and the batch goes on
+    static const bool fetch = !NativeGl::DualSourceBlend() && NativeGl::FramebufferFetch();
+    if (batching_ && shaderBlend && !fetch)
     {
         for (const Rect& earlier : batchRects_)
         {
@@ -4750,7 +4971,7 @@ void HwGs::AddPrimitive(const Gs::Gs::DrawState& state, const Gs::Vertex* vertex
     }
 
     batching_ = true;
-    if (shaderBlend)
+    if (shaderBlend && !fetch)
     {
         batchRects_.push_back(rect);
     }
@@ -4897,6 +5118,134 @@ void HwGs::AddPrimitive(const Gs::Gs::DrawState& state, const Gs::Vertex* vertex
     stats.drawn++;
 }
 
+// The pages a batch's sprites were to overwrite whole: those they did are the target's now, as the sprites' are about to be drawn;
+// the others get their content loaded first, before the batch's draw, as they would have at the first sprite (the batch is set
+// aside while memory's passes run, as the loads flush)
+void HwGs::ResolveDeferred()
+{
+    for (auto& t : targets_)
+    {
+        if (t->deferred.none())
+        {
+            continue;
+        }
+
+        Gs::PageSet load;
+        for (u32 page = 0; page < Gs::PageCount; page++)
+        {
+            if (t->deferred.test(page))
+            {
+                if (t->covered[page] != FullCoverage(t.get()))
+                {
+                    load.set(page);
+                }
+                else
+                {
+                    stats.clearsSkipped++;
+                }
+
+                t->covered[page] = 0;
+            }
+        }
+
+        t->valid |= t->deferred;
+        t->deferred.reset();
+        if (load.any())
+        {
+            std::vector<HwVertex> batch;
+            batch.swap(vertexes_);
+            std::vector<Rect> rects;
+            rects.swap(batchRects_);
+            const bool wasBatching = batching_;
+            batching_ = false;
+            cpuReason = "deferred";
+            t->valid &= ~load;
+            SyncMem(load);
+            TargetFromMem(t.get(), load);
+            t->valid |= load;
+            batch.swap(vertexes_);
+            rects.swap(batchRects_);
+            batching_ = wasBatching;
+        }
+    }
+}
+
+// The mask of a page's blocks all covered (its pages are 64 x 32 or 64 x 64: 32 or 64 blocks)
+u64 HwGs::FullCoverage(const Target* target) const
+{
+    s32 pageWidth = 0;
+    s32 pageHeight = 0;
+    PageSize(target->psm, &pageWidth, &pageHeight);
+    const u32 blocks = static_cast<u32>(pageWidth / 8) * static_cast<u32>(pageHeight / 8);
+    return blocks >= 64 ? ~0ull : (1ull << blocks) - 1;
+}
+
+// Whether a sprite's draw can put off the load of the pages it draws (it overwrites every pixel of its rectangle, reading
+// nothing of what's there: no blend, test or mask), and whether the target's pages can be tracked that way
+bool HwGs::CanDefer(const Gs::Gs::DrawState& state, bool wrapAdd, const u32 channelMasks[4]) const
+{
+    static const bool off = std::getenv("TWIN_HW_NO_DEFERRED_LOAD") != nullptr;
+    return !off && state.type == Gs::PrimSprite && !state.blend && !wrapAdd && !state.date && (!state.alphaTest || state.atst == Gs::AtstAlways) &&
+           state.ztst == Gs::ZtstAlways && channelMasks[0] == 0 && channelMasks[1] == 0 && channelMasks[2] == 0 && channelMasks[3] == 0;
+}
+
+// The pages of the target the rectangle draws in that aren't valid: their load put off, the blocks the rectangle covers whole
+// noted (ResolveDeferred, at the batch's flush, loads the pages left uncovered). False when the target's pages aren't tracked
+// (not aligned, or pages bigger than the mask)
+bool HwGs::DeferLoad(Target* target, const Rect& rect, const Gs::PageSet& pages)
+{
+    if (!target->aligned)
+    {
+        return false;
+    }
+
+    s32 pageWidth = 0;
+    s32 pageHeight = 0;
+    PageSize(target->psm, &pageWidth, &pageHeight);
+    if (pageWidth / 8 * (pageHeight / 8) > 64)
+    {
+        return false;
+    }
+
+    if (target->covered.empty())
+    {
+        target->covered.assign(Gs::PageCount, 0);
+    }
+
+    const Gs::PageSet missing = pages & target->pages & ~target->valid;
+    for (u32 page = 0; page < Gs::PageCount; page++)
+    {
+        if (!missing.test(page))
+        {
+            continue;
+        }
+
+        const Rect& r = target->rects[page];
+        const s32 left = r.left - r.left % pageWidth;
+        const s32 top = r.top - r.top % pageHeight;
+        u64 mask = target->covered[page];
+        for (s32 j = 0; j < pageHeight / 8; j++)
+        {
+            const s32 y = top + j * 8;
+            // (rows past the target's height are never drawn: as good as covered)
+            const bool rowCovered = y >= static_cast<s32>(target->height) || (rect.top <= y && y + 7 <= rect.bottom);
+            for (s32 i = 0; i < pageWidth / 8; i++)
+            {
+                const s32 x = left + i * 8;
+                if (rowCovered && rect.left <= x && x + 7 <= rect.right)
+                {
+                    mask |= 1ull << (j * (pageWidth / 8) + i);
+                }
+            }
+        }
+
+        target->covered[page] = mask;
+    }
+
+    target->deferred |= missing;
+    return true;
+}
+
 void HwGs::Flush()
 {
     ScopedNs timed(stats.flushNs);
@@ -4909,6 +5258,7 @@ void HwGs::Flush()
     }
 
     MakeCurrent();
+    ResolveDeferred();
     stats.batches++;
     const BatchKey& k = key_;
     Gl& gl = GetGl();
@@ -4933,6 +5283,7 @@ void HwGs::Flush()
                              std::memcmp(depthStencil->stencilScissor, k.scissor, sizeof(k.scissor)) == 0;
     GLuint destination = 0;
     // (the shader reads the framebuffer itself where it can: no copy for its blend)
+    // (ANGLE on Vulkan has the fetch too, but drew wrong with it, and slower: the copies stay there)
     static const bool fetch = !NativeGl::DualSourceBlend() && NativeGl::FramebufferFetch();
     if (((k.program & BitShaderBlend) && !fetch) || (k.stencilDate && !stencilKept))
     {
@@ -5345,6 +5696,13 @@ bool HwGs::DisplayTexture(NativeGraphics::DisplayTexture* display, Target** show
 {
     MakeCurrent();
     Flush();
+    // (the frame's last pass timed to here, not to the next frame's first: the wait for it isn't the GPU's time)
+    if (queryOpen_)
+    {
+        GetGl().EndQuery(0x88BF);
+        queryOpen_ = false;
+    }
+
     if (!passCounts_.empty() && ++passFrames_ % 60 == 0)
     {
         u64 total = 0;
@@ -5353,10 +5711,21 @@ bool HwGs::DisplayTexture(NativeGraphics::DisplayTexture* display, Target** show
             total += entry.second;
         }
 
-        std::fprintf(stderr, "passes: %.1f a frame:", static_cast<double>(total) / 60.0);
+        std::map<std::string, u64> times;
+        u32 late = 0;
+        ReportPassTimes(times, &late);
+        u64 gpu = 0;
+        for (auto& entry : times)
+        {
+            gpu += entry.second;
+        }
+
+        std::fprintf(stderr, "passes: %.1f a frame (gpu %.1f ms a frame, %u passes' times late):", static_cast<double>(total) / 60.0,
+                     static_cast<double>(gpu) / 60.0 / 1e6, late);
         for (auto& entry : passCounts_)
         {
-            std::fprintf(stderr, " %s %.1f;", entry.first.c_str(), static_cast<double>(entry.second) / 60.0);
+            std::fprintf(stderr, " %s %.1f (%.2f ms);", entry.first.c_str(), static_cast<double>(entry.second) / 60.0,
+                         static_cast<double>(times[entry.first]) / 60.0 / 1e6);
         }
 
         std::fprintf(stderr, "\n");

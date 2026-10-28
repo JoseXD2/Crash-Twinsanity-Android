@@ -46,6 +46,10 @@ struct Registered
 
 std::mutex g_Lock;
 std::vector<Registered> g_Threads;
+// The registered thread's stack (its frames are walked only within it: a driver's code without frame pointers leaves x29
+// pointing anywhere)
+thread_local uintptr_t t_StackLow = 0;
+thread_local uintptr_t t_StackHigh = 0;
 Sample* g_Samples = nullptr;
 std::atomic<u32> g_Next{0};
 std::atomic<bool> g_Sampling{false};
@@ -85,10 +89,13 @@ void OnSignal(int, siginfo_t*, void* context)
         sample.frames[sample.count++] = lr;
     }
 
-    // x29 (rbp) points at the saved {previous fp, return address}; each must be above the last and 16-byte aligned
+    // x29 (rbp) points at the saved {previous fp, return address}; each must be above the last, 16-byte aligned and on
+    // this thread's stack
+    const uintptr_t low = t_StackLow;
+    const uintptr_t high = t_StackHigh;
     for (u32 i = 0; i < MostFrames && sample.count < MostFrames; i++)
     {
-        if (fp == 0 || (fp & 0xF) != 0)
+        if (fp == 0 || (fp & 0xF) != 0 || fp < low || fp + 16 > high)
         {
             break;
         }
@@ -174,6 +181,29 @@ void Report()
         }
 
         Native::Log("profile: %s: %u samples", thread.name.c_str(), count);
+        // By module first: the GL driver's and the system's time (without frame pointers to walk, and with thousands of
+        // addresses each a few samples) shows here and nowhere else
+        {
+            std::map<std::string, u32> modules;
+            for (const auto& entry : self)
+            {
+                std::string name = ModuleOffset(entry.first);
+                modules[name.substr(0, name.find('+'))] += entry.second;
+            }
+
+            std::vector<std::pair<u32, std::string>> sorted;
+            for (const auto& entry : modules)
+            {
+                sorted.emplace_back(entry.second, entry.first);
+            }
+
+            std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (u32 i = 0; i < sorted.size() && i < 12; i++)
+            {
+                Native::Log("profile: %s module %u %s", thread.name.c_str(), sorted[i].first, sorted[i].second.c_str());
+            }
+        }
+
         auto top = [&](const char* kind, const std::map<uintptr_t, u32>& counts, u32 most)
         {
             std::vector<std::pair<u32, uintptr_t>> sorted;
@@ -188,7 +218,7 @@ void Report()
                 Native::Log("profile: %s %s %u %s", thread.name.c_str(), kind, sorted[i].first, ModuleOffset(sorted[i].second).c_str());
             }
         };
-        top("self", self, 60);
+        top("self", self, 150);
         top("total", whole, 120);
     }
 }
@@ -198,6 +228,20 @@ namespace Native
 {
 void RegisterProfiledThread(const char* name)
 {
+    pthread_attr_t attributes;
+    if (pthread_getattr_np(pthread_self(), &attributes) == 0)
+    {
+        void* base = nullptr;
+        size_t size = 0;
+        if (pthread_attr_getstack(&attributes, &base, &size) == 0)
+        {
+            t_StackLow = reinterpret_cast<uintptr_t>(base);
+            t_StackHigh = t_StackLow + size;
+        }
+
+        pthread_attr_destroy(&attributes);
+    }
+
     std::lock_guard lock(g_Lock);
     g_Threads.push_back({static_cast<pid_t>(syscall(SYS_gettid)), name});
 }

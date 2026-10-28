@@ -23,7 +23,9 @@ if(ANDROID)
     # pools.h's explicit specializations lose their asm labels and bind to stand-ins)
     string(REPLACE "-g " "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ")
     # Frame pointers kept, for the sampling profiler's stack walks (profiler_posix.cpp)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -gline-tables-only -fno-omit-frame-pointer")
+    # The CPU's own thread-local storage rather than the emulated kind (a call for every thread_local read: the renderer reads
+    # a few for every primitive). Android 10 and later load a library that has it (android/'s minSdkVersion is 29)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -gline-tables-only -fno-omit-frame-pointer -fno-emulated-tls")
     set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 endif()
 

@@ -28,6 +28,7 @@ OUT = HERE / "build" / "android"
 DEPS = OUT / "deps"
 ABI = "arm64-v8a"
 API = 24
+# (the library needs Android 10 to load: -fno-emulated-tls, native/CMakeLists.txt; the manifest asks for 29)
 SDL_VERSION = "3.4.18"
 SDL_URL = f"https://github.com/libsdl-org/SDL/releases/download/release-{SDL_VERSION}/SDL3-{SDL_VERSION}.tar.gz"
 SDL_SHA256 = "9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3"
@@ -185,7 +186,7 @@ def package(ndk, sdl_prefix, sdl_src, ffmpeg, lib, args):
     unsigned = stage / "unsigned.apk"
     if aapt2:
         run([tools / "aapt2", "compile", "--dir", res, "-o", stage / "compiled" / "res.zip"])
-        run([tools / "aapt2", "link", "-o", unsigned, "-I", android_jar, "--manifest", manifest, "--min-sdk-version", str(API),
+        run([tools / "aapt2", "link", "-o", unsigned, "-I", android_jar, "--manifest", manifest, "--min-sdk-version", "29",
              "--target-sdk-version", "34", "--version-code", "1", "--version-name", "1.0.19", stage / "compiled" / "res.zip"])
     else:
         # (Debian's old aapt reads an older platform's android.jar: --aapt-platform)

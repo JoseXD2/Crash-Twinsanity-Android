@@ -71,6 +71,8 @@ struct HardwareStats
     u64 replaced;
     u64 copies;
     u64 readbacks;
+    // Pages a clear overwrote whole, not loaded first
+    u64 clearsSkipped;
     u64 decodes;
     u64 contentHits;
     const char* lastFallback;

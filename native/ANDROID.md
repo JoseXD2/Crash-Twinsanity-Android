@@ -1,6 +1,6 @@
 # The native build on Android
 
-The game built for Android (arm64-v8a, Android 7.0 and later) with the NDK's clang, as `libmain.so` under SDL3's activity,
+The game built for Android (arm64-v8a, Android 10 and later: its thread-local storage is the CPU's own, which older linkers can't load) with the NDK's clang, as `libmain.so` under SDL3's activity,
 drawing with OpenGL ES 3.0 instead of OpenGL 3.3, with touch controls on the screen. The platform code is the native one
 (native/NATIVE.md) with what Android needs apart:
 

@@ -159,6 +159,22 @@ bool LoadGl()
     ok &= Load(g_Gl.FenceSync, "glFenceSync");
     ok &= Load(g_Gl.WaitSync, "glWaitSync");
     ok &= Load(g_Gl.DeleteSync, "glDeleteSync");
+    // (optional: the timer queries, the EXT's entry points on ES)
+    g_Gl.GenQueries = nullptr;
+    if (!NativeGl::Es || NativeGl::HasExtension("GL_EXT_disjoint_timer_query"))
+    {
+        const char* suffix = NativeGl::Es ? "EXT" : "";
+        g_Gl.GenQueries = reinterpret_cast<void (*)(GLsizei, GLuint*)>(SDL_GL_GetProcAddress((std::string("glGenQueries") + suffix).c_str()));
+        g_Gl.BeginQuery = reinterpret_cast<void (*)(GLenum, GLuint)>(SDL_GL_GetProcAddress((std::string("glBeginQuery") + suffix).c_str()));
+        g_Gl.EndQuery = reinterpret_cast<void (*)(GLenum)>(SDL_GL_GetProcAddress((std::string("glEndQuery") + suffix).c_str()));
+        g_Gl.GetQueryObjectuiv = reinterpret_cast<void (*)(GLuint, GLenum, GLuint*)>(SDL_GL_GetProcAddress((std::string("glGetQueryObjectuiv") + suffix).c_str()));
+        g_Gl.GetQueryObjectui64v = reinterpret_cast<void (*)(GLuint, GLenum, GLuint64*)>(SDL_GL_GetProcAddress((std::string("glGetQueryObjectui64v") + suffix).c_str()));
+        if (g_Gl.BeginQuery == nullptr || g_Gl.EndQuery == nullptr || g_Gl.GetQueryObjectuiv == nullptr || g_Gl.GetQueryObjectui64v == nullptr)
+        {
+            g_Gl.GenQueries = nullptr;
+        }
+    }
+
     const char* caching = std::getenv("TWIN_HW_UNIFORM_CACHE");
     if (ok && (caching == nullptr || caching[0] != '0'))
     {
