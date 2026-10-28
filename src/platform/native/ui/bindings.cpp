@@ -2,6 +2,7 @@
 // page (olegpages.cpp, under TWIN_NATIVE), kept in the app's settings (Native::SettingsFolder()/controls.txt) and read by the pad
 // (pads.cpp's Read, through ReadBindings)
 #include "ui/bindings.h"
+#include "ui/touch.h"
 
 #include "native.h"
 
@@ -444,7 +445,8 @@ void ReadBindings(const bool* keys, SDL_Gamepad* gamepad, BoundPad* pad)
     bool playing = InPlay();
     // The mouse's buttons and wheel as keys only in play (in the menus they're the mouse's own), with the window in front (or
     // holding the mouse)
-    bool mouseHere = playing && (SDL_GetMouseFocus() != nullptr || MouseLookActive());
+    // (with the touch controls, a finger is the mouse to SDL: its button is never the spin's key)
+    bool mouseHere = playing && !TouchControlsEnabled() && (SDL_GetMouseFocus() != nullptr || MouseLookActive());
     SDL_MouseButtonFlags mouse = mouseHere ? SDL_GetMouseState(nullptr, nullptr) : 0;
     bool wheelUp = false;
     bool wheelDown = false;

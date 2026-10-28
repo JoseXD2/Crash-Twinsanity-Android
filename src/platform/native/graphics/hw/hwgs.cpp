@@ -3174,7 +3174,7 @@ void HwGs::SyncCpu(const Gs::PageSet& pages)
 
 void HwGs::ProcessWrites()
 {
-    ScopedNs timed(stats.memoryNs);
+    // (not timed: called for every primitive, and a clock read each showed in the profile)
     if (!anyWritten_.exchange(false, std::memory_order_acquire))
     {
         return;

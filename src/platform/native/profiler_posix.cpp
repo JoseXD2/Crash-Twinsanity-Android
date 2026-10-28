@@ -188,8 +188,8 @@ void Report()
                 Native::Log("profile: %s %s %u %s", thread.name.c_str(), kind, sorted[i].first, ModuleOffset(sorted[i].second).c_str());
             }
         };
-        top("self", self, 150);
-        top("total", whole, 300);
+        top("self", self, 60);
+        top("total", whole, 120);
     }
 }
 }
@@ -223,29 +223,35 @@ void StartProfiler()
     std::thread([delay, seconds]
     {
         std::this_thread::sleep_for(std::chrono::duration<double>(delay));
-        Log("profile: sampling for %.0f s", seconds);
-        g_Sampling = true;
-        auto end = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
-        pid_t pid = getpid();
-        while (std::chrono::steady_clock::now() < end)
+        // Window after window (the frame statistics' lines between them say what the game was doing in each)
+        for (u32 window = 1;; window++)
         {
-            std::vector<Registered> threads;
+            Log("profile: window %u: sampling for %.0f s", window, seconds);
+            g_Next = 0;
+            g_Sampling = true;
+            auto end = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
+            pid_t pid = getpid();
+            while (std::chrono::steady_clock::now() < end)
             {
-                std::lock_guard lock(g_Lock);
-                threads = g_Threads;
+                std::vector<Registered> threads;
+                {
+                    std::lock_guard lock(g_Lock);
+                    threads = g_Threads;
+                }
+
+                for (const Registered& thread : threads)
+                {
+                    syscall(SYS_tgkill, pid, thread.tid, SIGPROF);
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 
-            for (const Registered& thread : threads)
-            {
-                syscall(SYS_tgkill, pid, thread.tid, SIGPROF);
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            g_Sampling = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            Log("profile: window %u:", window);
+            Report();
         }
-
-        g_Sampling = false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        Report();
     }).detach();
 }
 }
