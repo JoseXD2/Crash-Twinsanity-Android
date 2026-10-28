@@ -1,5 +1,6 @@
 // The machine: start-up, the console's language and clock (the PS2's OSD settings), memory, time, the I/O processor, and the
 // native build's settings and log
+#include "graphics/glcompat.h"
 #include "graphics/renderthread.h"
 #include "graphics/window.h"
 #include "native.h"
@@ -144,6 +145,17 @@ std::string Native::SettingsFolder()
 #elif defined(__APPLE__)
     const char* home = std::getenv("HOME");
     return std::string(home != nullptr ? home : ".") + "/Library/Application Support/Crash Twinsanity";
+#elif defined(__ANDROID__)
+    // Android: the app's external files folder (Android/data/org.twinsanity.native/files on the shared storage, reachable
+    // over USB and by file managers), else its private internal one
+    const char* external = SDL_GetAndroidExternalStoragePath();
+    if (external != nullptr && (SDL_GetAndroidExternalStorageState() & SDL_ANDROID_EXTERNAL_STORAGE_WRITE) != 0)
+    {
+        return external;
+    }
+
+    const char* internal = SDL_GetAndroidInternalStoragePath();
+    return internal != nullptr ? internal : ".";
 #else
     const char* home = std::getenv("HOME");
     const char* config = std::getenv("XDG_CONFIG_HOME");
@@ -327,7 +339,8 @@ std::string CheckDiscImage(const std::string& image)
     if (!Native::Disc::Open(image.c_str()))
     {
         std::error_code error;
-        if (!std::filesystem::exists(std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(image.data()), image.size())), error))
+        bool uri = image.rfind("content://", 0) == 0;
+        if (!uri && !std::filesystem::exists(std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(image.data()), image.size())), error))
         {
             return Format("The disc image isn't where it was: %s (moved, renamed or deleted?).", image.c_str());
         }
@@ -474,8 +487,15 @@ void Platform::System::Initialise()
         }
 
         const NativeUi::Resolution defaults = NativeUi::DefaultResolution();
-        SDL_Window* window = SDL_CreateWindow("Crash Twinsanity", defaults.windowWidth, defaults.windowHeight,
-                                              SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#if defined(__ANDROID__)
+        // The whole screen, landscape
+        SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+        flags |= SDL_WINDOW_FULLSCREEN;
+#endif
+        // The context's kind before the window: its surface's configuration is chosen then (EGL)
+        NativeGl::SetContextAttributes();
+        SDL_Window* window = SDL_CreateWindow("Crash Twinsanity", defaults.windowWidth, defaults.windowHeight, flags);
         if (window == nullptr)
         {
             Native::Fatal("the window couldn't be made: %s", SDL_GetError());

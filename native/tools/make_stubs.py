@@ -90,11 +90,17 @@ def system_symbols():
                 if len(parts) >= 2 and not l.endswith(":"):
                     found.add(parts[-1])
     else:
-        for library in ("/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libm.so.6",
-                        "/lib/x86_64-linux-gnu/libstdc++.so.6"):
+        # The host's C and C++ libraries, and a cross build's (Android: the NDK sysroot's bionic and libc++, $TWIN_HOST_LIBS
+        # from native/CMakeLists.txt)
+        libraries = ["/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libm.so.6", "/lib/x86_64-linux-gnu/libstdc++.so.6"]
+        libraries += host.host_libs()
+        for library in libraries:
             if Path(library).exists():
-                found.update(l.split()[-1].split("@")[0] for l in subprocess.run(
-                    ["nm", "-D", "--defined-only", library], capture_output=True, text=True).stdout.splitlines() if l.strip())
+                flags = ["--defined-only"] if library.endswith(".a") else ["-D", "--defined-only"]
+                for l in subprocess.run([NM] + flags + [library], capture_output=True, text=True).stdout.splitlines():
+                    parts = l.split()
+                    if len(parts) >= 2 and not l.endswith(":"):
+                        found.add(parts[-1].split("@")[0])
     return found
 
 system = system_symbols()

@@ -12,7 +12,22 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#if defined(__ANDROID__)
+// Bionic has execinfo.h from API 33 only: no backtraces on Android (the crash goes to logcat with the tombstone's own)
+#include <unistd.h>
+namespace
+{
+inline int backtrace(void**, int)
+{
+    return 0;
+}
+inline void backtrace_symbols_fd(void* const*, int, int)
+{
+}
+}
+#else
 #include <execinfo.h>
+#endif
 #include <fstream>
 #include <sys/ucontext.h>
 #include <unistd.h>

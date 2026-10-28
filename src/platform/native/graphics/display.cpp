@@ -17,6 +17,7 @@
 
 #include "game/renderer.h"
 #include "fixes.h"
+#include "glcompat.h"
 #include "native.h"
 
 #include <SDL3/SDL.h>
@@ -162,9 +163,11 @@ void Load(T& function, const char* name)
     }
 }
 
-GLuint Compile(Gl& gl, GLenum kind, const char* source, bool required = true)
+GLuint Compile(Gl& gl, GLenum kind, const char* given, bool required = true)
 {
     GLuint shader = gl.CreateShader(kind);
+    std::string translated = NativeGl::Shader(given);
+    const char* source = translated.c_str();
     gl.ShaderSource(shader, 1, &source, nullptr);
     gl.CompileShader(shader);
     GLint ok = 0;
@@ -173,7 +176,7 @@ GLuint Compile(Gl& gl, GLenum kind, const char* source, bool required = true)
     {
         char log[1024];
         gl.GetShaderInfoLog(shader, sizeof(log), nullptr, log);
-        std::fprintf(stderr, "graphics: shader: %s\n", log);
+        NativeGl::ReportShaderFailure("presenter shader", log, translated);
         if (required)
         {
             std::abort();
@@ -448,29 +451,30 @@ void Present(const NativeGraphics::Picture& picture)
 
 namespace NativeGraphics
 {
-bool PresenterContext(SDL_Window** window, SDL_GLContext* context)
+bool PresenterContext(NativeGl::Context* context)
 {
     if (g_Presenter.window == nullptr || g_Presenter.context == nullptr)
     {
         return false;
     }
 
-    *window = g_Presenter.window;
-    *context = g_Presenter.context;
+    *context = NativeGl::Context{};
+    context->window = g_Presenter.window;
+    context->context = g_Presenter.context;
     return true;
 }
 
 namespace
 {
 // The render thread's context (renderthread.h): made on the main thread, sharing the window's context's objects (the shown
-// picture's copies, their fences) when there's a window, with a hidden window of its own to be current with
-SDL_Window* g_RenderWindow = nullptr;
-SDL_GLContext g_RenderContext = nullptr;
+// picture's copies, their fences) when there's a window: a hidden window's of its own to be current with, or on Android
+// (one window only) the window's with no surface (graphics/glcompat.h)
+NativeGl::Context g_RenderContext;
 }
 
 bool MakeRenderContext()
 {
-    if (g_RenderContext != nullptr)
+    if (g_RenderContext.context != nullptr)
     {
         return true;
     }
@@ -482,43 +486,10 @@ bool MakeRenderContext()
     }
 
     Presenter& p = g_Presenter;
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
-    if (p.context != nullptr)
+    if (!NativeGl::CreateOffscreenContext(p.window, p.context, &g_RenderContext))
     {
-        SDL_GL_MakeCurrent(p.window, p.context);
-        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
-    }
-
-    g_RenderWindow = SDL_CreateWindow("graphics", 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
-    if (g_RenderWindow != nullptr)
-    {
-        g_RenderContext = SDL_GL_CreateContext(g_RenderWindow);
-    }
-
-    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
-    if (g_RenderContext == nullptr)
-    {
-        std::fprintf(stderr, "graphics: render thread: no OpenGL 3.3 context: %s\n", SDL_GetError());
-        if (g_RenderWindow != nullptr)
-        {
-            SDL_DestroyWindow(g_RenderWindow);
-            g_RenderWindow = nullptr;
-        }
-
+        std::fprintf(stderr, "graphics: render thread: no OpenGL context: %s\n", SDL_GetError());
         return false;
-    }
-
-    // Making it made it current here: the window's again (the render thread makes its own current there)
-    if (p.context != nullptr)
-    {
-        SDL_GL_MakeCurrent(p.window, p.context);
-    }
-    else
-    {
-        SDL_GL_MakeCurrent(g_RenderWindow, nullptr);
     }
 
     return true;
@@ -526,22 +497,21 @@ bool MakeRenderContext()
 
 void UseRenderContext()
 {
-    SDL_GL_MakeCurrent(g_RenderWindow, g_RenderContext);
+    NativeGl::MakeCurrent(g_RenderContext);
 }
 
 void ReleaseRenderContext()
 {
-    SDL_GL_MakeCurrent(g_RenderWindow, nullptr);
+    NativeGl::ReleaseCurrent(g_RenderContext);
 }
 
-bool RenderContext(SDL_Window** window, SDL_GLContext* context)
+bool RenderContext(NativeGl::Context* context)
 {
-    if (!OnRenderThread() || g_RenderContext == nullptr)
+    if (!OnRenderThread() || g_RenderContext.context == nullptr)
     {
         return false;
     }
 
-    *window = g_RenderWindow;
     *context = g_RenderContext;
     return true;
 }
@@ -760,10 +730,7 @@ int NativeGraphicsPostFilterInUse()
 void NativeGraphicsAttachWindow(SDL_Window* window)
 {
     Presenter& p = g_Presenter;
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+    NativeGl::SetContextAttributes();
     p.context = SDL_GL_CreateContext(window);
     if (p.context == nullptr)
     {
@@ -1070,6 +1037,14 @@ void ThreadedFrameStats(const Shown* shown)
         return;
     }
 
+#if defined(__ANDROID__)
+    // Android (entry.cpp sets the variable): one line every 60 pictures, its numbers the 60 pictures' sums
+    static u32 pictures = 0;
+    if (++pictures % 60 != 0)
+    {
+        return;
+    }
+#endif
     static auto last = std::chrono::steady_clock::now();
     static u64 vu1 = 0, vu0 = 0, prims = 0, pixels = 0, vu1Ns = 0, translated = 0, busy = 0, waited = 0;
     Hardware& h = GetHardware();

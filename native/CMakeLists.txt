@@ -18,9 +18,20 @@ endif()
 # (game/pools.h's), whose callers then don't link. File and line in backtraces is what debugging the port needs
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -gline-tables-only -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g")
+if(ANDROID)
+    # The NDK's toolchain puts -g in every build's flags: line tables only, as above (with full debug info the callers of
+    # pools.h's explicit specializations lose their asm labels and bind to stand-ins)
+    string(REPLACE "-g " "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -gline-tables-only")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
+endif()
 
 find_package(SDL3 REQUIRED CONFIG)
-find_package(OpenGL REQUIRED)
+# OpenGL ES 3.0 (Android; on Linux for testing the ES path on Mesa) instead of OpenGL 3.3 core: src/platform/native/graphics/glcompat.h
+option(TWIN_GLES "Draw with OpenGL ES 3.0 rather than OpenGL 3.3" ${ANDROID})
+if(NOT TWIN_GLES)
+    find_package(OpenGL REQUIRED)
+endif()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 # The movies' MPEG-2 pictures (src/platform/native/movie/): FFmpeg's libavcodec and libavutil. Our own LGPL 2.1, decode-only
 # build (native/tools/build_ffmpeg.sh, in build/native/ffmpeg/<os>-<arch>) when it's there, else the system's pkg-config one
@@ -115,7 +126,18 @@ endif()
 # Separated by | (a CMake list's ; would split the command's argument, and Windows' paths have colons)
 string(REPLACE ";" "|" TWIN_HOST_INCLUDES_ENV "${TWIN_HOST_INCLUDES}")
 string(REPLACE ";" "|" TWIN_HOST_LIBS_ENV "${TWIN_HOST_LIBS}")
-set(TWIN_TOOL_ENV ${CMAKE_COMMAND} -E env "TWIN_CLANG=${CMAKE_CXX_COMPILER}" "TWIN_HOST_INCLUDES=${TWIN_HOST_INCLUDES_ENV}"
+# The clang the layout tools run: the build's compiler, unless a cross build names one that carries its target (Android: the
+# NDK's aarch64-linux-android24-clang++ wrapper; native/tools/build_android.py)
+set(TWIN_TOOL_CLANG "${CMAKE_CXX_COMPILER}" CACHE FILEPATH "The clang++ the layout tools (data_types.py, convert_data.py) run")
+if(ANDROID)
+    # The system's libraries for make_stubs.py (what the C library, libc++ and the NDK's libraries define is never stood in for)
+    file(GLOB TWIN_ANDROID_SYSTEM_LIBS "${CMAKE_SYSROOT}/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/${ANDROID_PLATFORM_LEVEL}/*.so"
+         "${CMAKE_SYSROOT}/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/libc++_shared.so" "${CMAKE_SYSROOT}/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/libc++_static.a"
+         "${CMAKE_SYSROOT}/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/libc++abi.a")
+    list(APPEND TWIN_HOST_LIBS ${TWIN_ANDROID_SYSTEM_LIBS})
+    string(REPLACE ";" "|" TWIN_HOST_LIBS_ENV "${TWIN_HOST_LIBS}")
+endif()
+set(TWIN_TOOL_ENV ${CMAKE_COMMAND} -E env "TWIN_CLANG=${TWIN_TOOL_CLANG}" "TWIN_HOST_INCLUDES=${TWIN_HOST_INCLUDES_ENV}"
     "TWIN_HOST_LIBS=${TWIN_HOST_LIBS_ENV}")
 
 # The game's C++, and the decomp's own C++ of the retail C library and maths (portable, kept for their exact results)
@@ -235,8 +257,23 @@ if(WIN32)
         COMMENT "Listing the functions the System V convention calls"
         VERBATIM)
 endif()
-add_executable(twinsanity $<TARGET_OBJECTS:game> ${STUBS_CPP} ${TWIN_SYSV_CPP})
+# Extra sources for a particular build (a test harness's stand-ins), none normally
+set(TWIN_EXTRA_SOURCES "" CACHE STRING "Extra source files linked into the program")
+if(ANDROID)
+    # Android: the game is libmain.so, which SDL's activity loads and whose SDL_main it calls (android/, native/ANDROID.md)
+    add_library(twinsanity SHARED $<TARGET_OBJECTS:game> ${STUBS_CPP} ${TWIN_EXTRA_SOURCES})
+    set_target_properties(twinsanity PROPERTIES OUTPUT_NAME "main")
+    target_link_libraries(twinsanity PRIVATE log android EGL)
+else()
+    add_executable(twinsanity $<TARGET_OBJECTS:game> ${STUBS_CPP} ${TWIN_SYSV_CPP} ${TWIN_EXTRA_SOURCES})
+endif()
 
+if(TWIN_GLES)
+    # The GL users alone (src/platform/native/graphics/glcompat.h): the rest of the build is the same either way
+    file(GLOB TWIN_GL_SOURCES CONFIGURE_DEPENDS ${ROOT}/src/platform/native/graphics/*.cpp ${ROOT}/src/platform/native/graphics/hw/*.cpp
+         ${ROOT}/src/platform/native/ui/overlayrender.cpp ${ROOT}/src/platform/native/ui/crtfilter.cpp)
+    set_property(SOURCE ${TWIN_GL_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS TWIN_GLES)
+endif()
 foreach(target game twinsanity)
 target_include_directories(${target} PRIVATE ${ROOT}/native/include ${ROOT}/include ${ROOT}/src/platform/native)
 target_compile_definitions(${target} PRIVATE TWIN_NATIVE)
@@ -253,7 +290,10 @@ target_compile_options(${target} PRIVATE
     -std=gnu++2c -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-strict-aliasing -fno-delete-null-pointer-checks -fwrapv
     -ffp-contract=off -fno-strict-float-cast-overflow -Wall -Wno-invalid-offsetof -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable
     -Wno-unknown-pragmas -Wno-missing-braces -Wno-mismatched-tags)
-target_link_libraries(${target} PRIVATE SDL3::SDL3 OpenGL::GL PkgConfig::FFMPEG)
+target_link_libraries(${target} PRIVATE SDL3::SDL3 PkgConfig::FFMPEG)
+if(NOT TWIN_GLES)
+    target_link_libraries(${target} PRIVATE OpenGL::GL)
+endif()
 if(WIN32)
     # MinGW lays bitfields out the Microsoft way by default; the game's (and its files') are GCC's, as on every other host
     # (native/tools/host.py gives the layout tools the same flag)

@@ -5,6 +5,7 @@
 #include "fixes.h"
 #include "platform/pads.h"
 #include "ui/bindings.h"
+#include "ui/touch.h"
 
 #include <SDL3/SDL.h>
 
@@ -287,6 +288,9 @@ s32 Platform::Pads::Read(s32 port, s32 slot, u8* data)
     }
 
     NativeUi::ReadBindings(keys, g_Gamepad, &bound);
+    // The touch controls' buttons and sticks over them (Android; ui/touch.cpp)
+    NativeUi::StartTouchControls();
+    NativeUi::ReadTouchControls(&bound);
     u32 buttons = bound.buttons;
     u8 pressure[PressureReportBytes] = {};
     pressure[PressureL2] = bound.l2Pressure;

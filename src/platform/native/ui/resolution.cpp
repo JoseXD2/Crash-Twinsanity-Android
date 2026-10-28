@@ -33,7 +33,12 @@ constexpr WindowSize Windows[DisplayChoices - 1] = {
 static_assert(DisplayChoices - 1 == sizeof(Windows) / sizeof(Windows[0]));
 constexpr s32 FullscreenChoice = DisplayChoices - 1;
 // The defaults (nativeui.h's DefaultResolution): the platform's window is made at their size (system.cpp)
+#if defined(__ANDROID__)
+// Android: the PS2's own resolution (a phone's GPU and the readbacks the renderer makes are slower than a PC's)
+constexpr Resolution Defaults = {1, 1280, 720, true};
+#else
 constexpr Resolution Defaults = {2, 1280, 720, false};
+#endif
 
 bool g_Known = false;
 Resolution g_Current = Defaults;

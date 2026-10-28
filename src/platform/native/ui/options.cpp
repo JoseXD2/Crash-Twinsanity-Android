@@ -67,7 +67,12 @@ constexpr OptionInfo Infos[OptionCount] = {
     {OptionLanguage, "language", 0, 5},
     {OptionDetailedLog, "detailed_log", 0, 1},
     {OptionMenuHints, "menu_hints", 0, 1},
+#if defined(__ANDROID__)
+    // Android: the counter on from the start, while the port's speed on phones is being found out
+    {OptionShowFps, "show_fps", 1, 1},
+#else
     {OptionShowFps, "show_fps", 0, 1},
+#endif
 };
 
 s32 g_Values[OptionCount];

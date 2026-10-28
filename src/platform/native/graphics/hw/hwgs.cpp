@@ -31,6 +31,7 @@
 #include "hwgs.h"
 
 #include "gl.h"
+#include "../glcompat.h"
 #include "replace.h"
 
 #define XXH_INLINE_ALL
@@ -60,8 +61,8 @@
 namespace NativeGraphics
 {
 // The presenter's window and context (display.cpp), shared when there is one; the render thread's own (on it)
-bool PresenterContext(SDL_Window** window, SDL_GLContext* context);
-bool RenderContext(SDL_Window** window, SDL_GLContext* context);
+bool PresenterContext(NativeGl::Context* context);
+bool RenderContext(NativeGl::Context* context);
 }
 
 namespace NativeGraphics
@@ -1111,10 +1112,11 @@ struct ContentTexture
     GLuint replacement = 0;
 };
 
-GLuint CompileShader(GLenum kind, const std::string& source)
+GLuint CompileShader(GLenum kind, const std::string& given)
 {
     Gl& gl = GetGl();
     GLuint shader = gl.CreateShader(kind);
+    std::string source = NativeGl::Shader(given);
     const char* text = source.c_str();
     gl.ShaderSource(shader, 1, &text, nullptr);
     gl.CompileShader(shader);
@@ -1124,7 +1126,7 @@ GLuint CompileShader(GLenum kind, const std::string& source)
     {
         char log[2048];
         gl.GetShaderInfoLog(shader, sizeof(log), nullptr, log);
-        std::fprintf(stderr, "graphics: hardware shader: %s\n", log);
+        NativeGl::ReportShaderFailure("hardware shader", log, source);
         std::abort();
     }
 
@@ -1137,7 +1139,7 @@ GLuint LinkProgram(GLuint vertex, GLuint fragment, bool dualSource)
     GLuint program = gl.CreateProgram();
     gl.AttachShader(program, vertex);
     gl.AttachShader(program, fragment);
-    if (dualSource)
+    if (dualSource && gl.BindFragDataLocationIndexed != nullptr)
     {
         gl.BindFragDataLocationIndexed(program, 0, 0, "outColour");
         gl.BindFragDataLocationIndexed(program, 0, 1, "outFactor");
@@ -1205,6 +1207,12 @@ private:
     GLuint CopyTarget(Target* target, const Rect* region = nullptr);
     Target* ScratchStencil(Target* colour);
     void Staging(u32 width, u32 height, bool depth, GLuint* texture, GLuint* fbo);
+    // Reads back as OpenGL ES allows: the bound R32UI framebuffer's words (ES: RGBA_INTEGER, four a pixel, compacted), and
+    // a depth texture's values as floats (ES: drawn into an R32F texture first, as a depth buffer can't be read)
+    void ReadWords(GLint x, GLint y, GLsizei width, GLsizei height, void* to);
+    void ReadDepth(GLuint depthTexture, GLsizei width, GLsizei height, void* to);
+    std::vector<u32> readScratch_;
+    std::map<std::pair<u32, u32>, std::pair<GLuint, GLuint>> depthReads_;
 
     Gs::Gs& gs_;
     u32 scale_;
@@ -1382,9 +1390,9 @@ private:
     std::vector<u32> upload_;
     std::vector<f32> uploadDepth_;
     std::map<std::string, bool> reported_;
-    SDL_Window* ownWindow_ = nullptr;
-    SDL_GLContext context_ = nullptr;
-    SDL_Window* window_ = nullptr;
+    // The context drawn with: the render thread's, the presenter's, or one of its own (no window: the tests')
+    NativeGl::Context context_;
+    bool ownContext_ = false;
     // The shown picture's copies for the render thread's hand-over
     struct ShownCopy
     {
@@ -1419,42 +1427,30 @@ HwGs::~HwGs()
 
 void HwGs::MakeCurrent()
 {
-    if (SDL_GL_GetCurrentContext() != context_)
+    if (!NativeGl::IsCurrent(context_))
     {
-        SDL_GL_MakeCurrent(window_, context_);
+        NativeGl::MakeCurrent(context_);
     }
 }
 
 bool HwGs::Init()
 {
-    if (!RenderContext(&window_, &context_) && !PresenterContext(&window_, &context_))
+    if (!RenderContext(&context_) && !PresenterContext(&context_))
     {
-        // No window: one of its own, hidden
+        // No window: a context of its own, hidden
         if (!SDL_WasInit(SDL_INIT_VIDEO) && !SDL_InitSubSystem(SDL_INIT_VIDEO))
         {
             std::fprintf(stderr, "graphics: hardware renderer: no video: %s\n", SDL_GetError());
             return false;
         }
 
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
-        ownWindow_ = SDL_CreateWindow("graphics", 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
-        if (ownWindow_ == nullptr)
+        if (!NativeGl::CreateOffscreenContext(nullptr, nullptr, &context_))
         {
-            std::fprintf(stderr, "graphics: hardware renderer: no window: %s\n", SDL_GetError());
+            std::fprintf(stderr, "graphics: hardware renderer: no OpenGL context: %s\n", SDL_GetError());
             return false;
         }
 
-        context_ = SDL_GL_CreateContext(ownWindow_);
-        if (context_ == nullptr)
-        {
-            std::fprintf(stderr, "graphics: hardware renderer: no OpenGL 3.3: %s\n", SDL_GetError());
-            return false;
-        }
-
-        window_ = ownWindow_;
+        ownContext_ = true;
     }
 
     MakeCurrent();
@@ -1593,7 +1589,7 @@ void HwGs::Staging(u32 width, u32 height, bool depth, GLuint* texture, GLuint* f
         gl.TexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL_DEPTH32F_STENCIL8), static_cast<GLsizei>(width),
                       static_cast<GLsizei>(height), 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, nullptr);
         gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, *texture, 0);
-        gl.DrawBuffer(GL_NONE);
+        DrawNone(gl);
         gl.ReadBuffer(GL_NONE);
     }
     else
@@ -1604,6 +1600,84 @@ void HwGs::Staging(u32 width, u32 height, bool depth, GLuint* texture, GLuint* f
     }
 
     staging_[key] = {*texture, *fbo};
+}
+
+void HwGs::ReadWords(GLint x, GLint y, GLsizei width, GLsizei height, void* to)
+{
+    Gl& gl = GetGl();
+    if (!IsEs())
+    {
+        gl.ReadPixels(x, y, width, height, GL_RED_INTEGER, GL_UNSIGNED_INT, to);
+        return;
+    }
+
+    // ES reads an integer buffer as RGBA_INTEGER always; RED_INTEGER only when the implementation says so
+    static GLint readFormat = -1;
+    if (readFormat < 0)
+    {
+        GLint format = 0;
+        GLint type = 0;
+        gl.GetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &format);
+        gl.GetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &type);
+        readFormat = (static_cast<GLenum>(format) == GL_RED_INTEGER && static_cast<GLenum>(type) == GL_UNSIGNED_INT) ? 1 : 0;
+    }
+
+    if (readFormat == 1)
+    {
+        gl.ReadPixels(x, y, width, height, GL_RED_INTEGER, GL_UNSIGNED_INT, to);
+        return;
+    }
+
+    size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    readScratch_.resize(count * 4);
+    gl.ReadPixels(x, y, width, height, GL_RGBA_INTEGER, GL_UNSIGNED_INT, readScratch_.data());
+    u32* words = static_cast<u32*>(to);
+    for (size_t i = 0; i < count; i++)
+    {
+        words[i] = readScratch_[i * 4];
+    }
+}
+
+void HwGs::ReadDepth(GLuint depthTexture, GLsizei width, GLsizei height, void* to)
+{
+    Gl& gl = GetGl();
+    if (!IsEs())
+    {
+        gl.ReadPixels(0, 0, width, height, GL_DEPTH_COMPONENT, GL_FLOAT, to);
+        return;
+    }
+
+    // The depth texture's values drawn into an R32F texture (the copy program reads a depth texture's .r), then read as
+    // RGBA floats (what ES allows of a float buffer) and compacted
+    auto key = std::make_pair(static_cast<u32>(width), static_cast<u32>(height));
+    auto& made = depthReads_[key];
+    if (made.first == 0)
+    {
+        gl.GenTextures(1, &made.first);
+        gl.BindTexture(GL_TEXTURE_2D, made.first);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        gl.TexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL_R32F), width, height, 0, GL_RED, GL_FLOAT, nullptr);
+        gl.GenFramebuffers(1, &made.second);
+        gl.BindFramebuffer(GL_FRAMEBUFFER, made.second);
+        gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, made.first, 0);
+    }
+
+    gl.BindFramebuffer(GL_FRAMEBUFFER, made.second);
+    Pass(made.second, "depth read");
+    CopyRect(copyColourProgram_, depthTexture, static_cast<f32>(width), static_cast<f32>(height), 0, 0, width, height);
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, made.second);
+    gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
+    gl.PixelStorei(GL_PACK_ROW_LENGTH, 0);
+    size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    readScratch_.resize(count * 4);
+    gl.ReadPixels(0, 0, width, height, GL_RGBA, GL_FLOAT, readScratch_.data());
+    u32* words = static_cast<u32*>(to);
+    for (size_t i = 0; i < count; i++)
+    {
+        words[i] = readScratch_[i * 4];
+    }
 }
 
 Target* HwGs::TargetFor(u32 bp, u32 bw, u32 psm, u32 height, bool frame)
@@ -1676,7 +1750,7 @@ Target* HwGs::TargetFor(u32 bp, u32 bw, u32 psm, u32 height, bool frame)
         gl.TexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL_DEPTH32F_STENCIL8), w, h, 0, GL_DEPTH_STENCIL,
                       GL_FLOAT_32_UNSIGNED_INT_24_8_REV, nullptr);
         gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, t.texture, 0);
-        gl.DrawBuffer(GL_NONE);
+        DrawNone(gl);
         gl.ReadBuffer(GL_NONE);
     }
     else
@@ -2929,8 +3003,7 @@ void HwGs::SyncCpu(const Gs::PageSet& pages)
         }
 
         u8* to = shadow_.data() + static_cast<size_t>(page) * 8192;
-        gl.ReadPixels(0, static_cast<GLint>(page * 2), 1024, static_cast<GLsizei>((end - page + 1) * 2), GL_RED_INTEGER,
-                      GL_UNSIGNED_INT, to);
+        ReadWords(0, static_cast<GLint>(page * 2), 1024, static_cast<GLsizei>((end - page + 1) * 2), to);
         std::memcpy(memory + static_cast<size_t>(page) * 8192, to, static_cast<size_t>(end - page + 1) * 8192);
         for (u32 p = page; p <= end; p++)
         {
@@ -3060,7 +3133,7 @@ void HwGs::Download(Target* target)
     readback_.resize(static_cast<size_t>(w) * h * 4);
     if (target->depth)
     {
-        gl.ReadPixels(0, 0, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, readback_.data());
+        ReadDepth(small, w, h, readback_.data());
     }
     else
     {
@@ -3796,6 +3869,12 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
         }
         else if (state.blendC != 0)
         {
+            glCan = false;
+        }
+        else if (!NativeGl::DualSourceBlend())
+        {
+            // The source alpha's factor needs the dual-source blend (GL_EXT_blend_func_extended on OpenGL ES): without it the
+            // shader blends
             glCan = false;
         }
 
@@ -4817,7 +4896,11 @@ void HwGs::Flush()
     }
 
     gl.Disable(GL_CULL_FACE);
-    gl.Enable(GL_PROGRAM_POINT_SIZE);
+    if (!IsEs())
+    {
+        // (OpenGL ES always takes the vertex shader's gl_PointSize)
+        gl.Enable(GL_PROGRAM_POINT_SIZE);
+    }
     if (k.depth != nullptr)
     {
         gl.Enable(GL_DEPTH_TEST);
@@ -4855,7 +4938,10 @@ void HwGs::Flush()
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, static_cast<GLint>(k.magFilter));
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, static_cast<GLint>(k.wrapS));
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, static_cast<GLint>(k.wrapT));
-        gl.TexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, static_cast<f32>(k.anisotropy != 0 ? k.anisotropy : 1));
+        if (HasAnisotropy())
+        {
+            gl.TexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, static_cast<f32>(k.anisotropy != 0 ? k.anisotropy : 1));
+        }
     }
 
     gl.BindVertexArray(vertexArray_);
@@ -5040,6 +5126,12 @@ bool HwGs::DebugPixel(u32 psm, u32 bp, u32 bw, u32 x, u32 y, u32* value)
         GLint sy = static_cast<GLint>(y * t->scale);
         if (t->depth)
         {
+            if (IsEs())
+            {
+                // (OpenGL ES reads no depth back directly: the debug read isn't worth a pass)
+                return false;
+            }
+
             f32 d = 0.0f;
             gl.ReadPixels(sx, sy, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &d);
             *value = static_cast<u32>(std::min(std::floor(static_cast<double>(d) * 4294967296.0 + 0.5), 4294967295.0));

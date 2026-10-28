@@ -60,7 +60,10 @@ struct Gl
     void (*BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
     void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
     void (*ReadBuffer)(GLenum);
+    // GL 3.3's (null on OpenGL ES: DrawBuffers stands in, see DrawNone)
     void (*DrawBuffer)(GLenum);
+    void (*DrawBuffers)(GLsizei, const GLenum*);
+    void (*GetIntegerv)(GLenum, GLint*);
     void (*Viewport)(GLint, GLint, GLsizei, GLsizei);
     void (*Scissor)(GLint, GLint, GLsizei, GLsizei);
     void (*Enable)(GLenum);
@@ -81,6 +84,7 @@ struct Gl
     void (*DeleteShader)(GLuint);
     GLuint (*CreateProgram)();
     void (*AttachShader)(GLuint, GLuint);
+    // GL 3.3's dual-source outputs by name (null on OpenGL ES: the shader's layout qualifiers say)
     void (*BindFragDataLocationIndexed)(GLuint, GLuint, GLuint, const GLchar*);
     void (*BindAttribLocation)(GLuint, GLuint, const GLchar*);
     void (*LinkProgram)(GLuint);
@@ -105,6 +109,7 @@ struct Gl
     void (*DrawArrays)(GLenum, GLint, GLsizei);
     void (*Finish)();
     GLenum (*GetError)();
+    // GL 3.3's (null on OpenGL ES: the vertex shader's gl_PointSize alone)
     void (*PointSize)(GLfloat);
     void (*LineWidth)(GLfloat);
     void (*Uniform4ui)(GLint, GLuint, GLuint, GLuint, GLuint);
@@ -125,4 +130,10 @@ struct Gl
 // The entry points (loaded the first time, with a context current); false when one is missing
 bool LoadGl();
 Gl& GetGl();
+// The bound framebuffer drawn to no colour buffer (a depth-only target)
+void DrawNone(Gl& gl);
+// Whether the context is OpenGL ES, and its extensions the renderer asks about (asked of the context LoadGl loaded on)
+bool IsEs();
+bool HasAnisotropy();
+constexpr GLenum GL_IMPLEMENTATION_COLOR_READ_FORMAT = 0x8B9B, GL_IMPLEMENTATION_COLOR_READ_TYPE = 0x8B9A, GL_RGBA_INTEGER = 0x8D99;
 }

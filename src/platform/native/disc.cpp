@@ -2,6 +2,8 @@
 #include "native.h"
 #include "platform/disc.h"
 
+#include <SDL3/SDL.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -394,6 +396,23 @@ bool Native::Disc::Open(const char* path)
         return true;
     }
 
+#if defined(__ANDROID__)
+    if (std::strncmp(path, "content://", 10) == 0)
+    {
+        // A document picked with the system's file dialog (SDL's on Android): its content URI opened through the content
+        // resolver (SDL's stream), whose descriptor is kept (pread works on it as on a file's)
+        SDL_IOStream* stream = SDL_IOFromFile(path, "rb");
+        if (stream == nullptr)
+        {
+            return false;
+        }
+
+        FILE* file = static_cast<FILE*>(SDL_GetPointerProperty(SDL_GetIOProperties(stream), SDL_PROP_IOSTREAM_STDIO_FILE_POINTER, nullptr));
+        g_Image = file != nullptr ? ::dup(fileno(file)) : -1;
+        SDL_CloseIO(stream);
+    }
+    else
+#endif
     g_Image = ::open(path, O_RDONLY);
     if (g_Image < 0)
     {

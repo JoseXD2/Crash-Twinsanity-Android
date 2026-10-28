@@ -8,6 +8,15 @@
 #include "ui/nativeui.h"
 
 #include <SDL3/SDL.h>
+#if defined(__ANDROID__)
+// Android: main is SDL_main, called by SDL's activity (android/app/src/main/java/org/twinsanity/app/TwinsanityActivity.java)
+#include <SDL3/SDL_main.h>
+#include <android/log.h>
+#include <unistd.h>
+
+#include <string>
+#include <thread>
+#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -156,8 +165,59 @@ void SetUpLog()
 }
 #endif
 
+#if defined(__ANDROID__)
+namespace
+{
+// Android shows nothing of stdout and stderr: both go through a pipe to logcat (tag "twinsanity"), a line at a time
+void StartLogcat()
+{
+    static int fds[2];
+    if (pipe(fds) != 0)
+    {
+        return;
+    }
+
+    dup2(fds[1], 1);
+    dup2(fds[1], 2);
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::thread([]
+    {
+        std::string line;
+        char buffer[512];
+        for (;;)
+        {
+            ssize_t got = read(fds[0], buffer, sizeof(buffer));
+            if (got <= 0)
+            {
+                break;
+            }
+
+            for (ssize_t i = 0; i < got; i++)
+            {
+                if (buffer[i] == '\n')
+                {
+                    __android_log_write(ANDROID_LOG_INFO, "twinsanity", line.c_str());
+                    line.clear();
+                }
+                else
+                {
+                    line += buffer[i];
+                }
+            }
+        }
+    }).detach();
+}
+}
+#endif
+
 int main(int argc, char** argv)
 {
+#if defined(__ANDROID__)
+    StartLogcat();
+    // The frames' statistics in the log (display.cpp: a line every 60 pictures), while the port's speed on phones is found out
+    setenv("TWIN_FRAME_STATS", "1", 0);
+#endif
     // What the log leaves out of its paths (the profile folder), before its first line
     Native::StartLogPrivacy();
     // Where the settings are (portable mode or not: portable.cpp) before anything reads or writes them, the log first

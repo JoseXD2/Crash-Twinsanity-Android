@@ -4,8 +4,10 @@
 // (stb_truetype), the options' backdrop worked out per pixel (its gradient, the ring target, the Twinsanity spiral of
 // native/design/options/spiral_grey.svg: two Archimedean arms r = 10 + 35.45 theta over 2.2 turns), images
 #include "ui/overlayinternal.h"
+#include "ui/touch.h"
 #include "ui/nativeui.h"
 
+#include "graphics/glcompat.h"
 #include "graphics/presenter.h"
 #include "native.h"
 
@@ -16,6 +18,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <string>
 #include <tuple>
 
 #include "../../../../native/third_party/stb/stb_truetype.h"
@@ -332,7 +335,7 @@ void main()
         }
         else
         {
-            vec2 q = vec2(abs(p.x), p.y + 0.08);
+            vec2 q = vec2(abs(p.x), 0.08 - p.y);
             float tri = max(q.x * 0.866 + q.y * 0.5, -q.y) - 0.27;
             stroke = abs(tri) - 0.08;
             ink = vec3(0.30, 0.86, 0.70);
@@ -419,9 +422,11 @@ GLint Uniform(Renderer& r, const char* name)
     return location;
 }
 
-GLuint Compile(Gl& gl, GLenum kind, const char* source)
+GLuint Compile(Gl& gl, GLenum kind, const char* given)
 {
     GLuint shader = gl.CreateShader(kind);
+    std::string translated = NativeGl::Shader(given);
+    const char* source = translated.c_str();
     gl.ShaderSource(shader, 1, &source, nullptr);
     gl.CompileShader(shader);
     GLint ok = 0;
@@ -430,7 +435,7 @@ GLuint Compile(Gl& gl, GLenum kind, const char* source)
     {
         char log[2048] = {};
         gl.GetShaderInfoLog(shader, sizeof(log), nullptr, log);
-        Native::Log("overlay: a shader didn't compile: %s", log);
+        NativeGl::ReportShaderFailure("overlay shader", log, translated);
         return 0;
     }
 
@@ -841,6 +846,7 @@ void OverlayHook(int pixelWidth, int pixelHeight, float pixelScale)
     NoteWindow(pixelWidth, pixelHeight, pixelScale);
     CountShownFrame(std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
     std::vector<OverlayFrame::Command> commands = SubmittedFrame();
+    AddTouchControls(&commands, pixelWidth, pixelHeight);
     AddFpsCounter(&commands, pixelWidth, pixelHeight);
     DrawFrame(commands, pixelWidth, pixelHeight);
 }
@@ -863,9 +869,7 @@ bool RenderFrameOffscreen(u32 width, u32 height, std::vector<u32>* pixels)
             return false;
         }
 
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        NativeGl::SetContextAttributes();
         window = SDL_CreateWindow("overlay", 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
         if (window == nullptr)
         {

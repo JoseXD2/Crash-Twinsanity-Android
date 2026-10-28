@@ -1,4 +1,5 @@
 #include "gl.h"
+#include "../glcompat.h"
 
 #include <SDL3/SDL.h>
 
@@ -15,6 +16,7 @@ namespace
 {
 Gl g_Gl;
 bool g_Loaded = false;
+bool g_Anisotropy = true;
 
 // The hardware renderer asks for its passes' uniforms by name every time it uses them (thousands a frame), and the driver looks
 // each name up again: the answers kept, a thread's (each has its own context) by program and name. The renderer's programs live
@@ -83,7 +85,20 @@ bool LoadGl()
     ok &= Load(g_Gl.BlitFramebuffer, "glBlitFramebuffer");
     ok &= Load(g_Gl.ReadPixels, "glReadPixels");
     ok &= Load(g_Gl.ReadBuffer, "glReadBuffer");
-    ok &= Load(g_Gl.DrawBuffer, "glDrawBuffer");
+    if (NativeGl::Es)
+    {
+        g_Gl.DrawBuffer = nullptr;
+        g_Gl.BindFragDataLocationIndexed = nullptr;
+        g_Gl.PointSize = nullptr;
+    }
+    else
+    {
+        ok &= Load(g_Gl.DrawBuffer, "glDrawBuffer");
+        ok &= Load(g_Gl.BindFragDataLocationIndexed, "glBindFragDataLocationIndexed");
+        ok &= Load(g_Gl.PointSize, "glPointSize");
+    }
+    ok &= Load(g_Gl.DrawBuffers, "glDrawBuffers");
+    ok &= Load(g_Gl.GetIntegerv, "glGetIntegerv");
     ok &= Load(g_Gl.Viewport, "glViewport");
     ok &= Load(g_Gl.Scissor, "glScissor");
     ok &= Load(g_Gl.Enable, "glEnable");
@@ -104,7 +119,6 @@ bool LoadGl()
     ok &= Load(g_Gl.DeleteShader, "glDeleteShader");
     ok &= Load(g_Gl.CreateProgram, "glCreateProgram");
     ok &= Load(g_Gl.AttachShader, "glAttachShader");
-    ok &= Load(g_Gl.BindFragDataLocationIndexed, "glBindFragDataLocationIndexed");
     ok &= Load(g_Gl.BindAttribLocation, "glBindAttribLocation");
     ok &= Load(g_Gl.LinkProgram, "glLinkProgram");
     ok &= Load(g_Gl.GetProgramiv, "glGetProgramiv");
@@ -128,7 +142,6 @@ bool LoadGl()
     ok &= Load(g_Gl.DrawArrays, "glDrawArrays");
     ok &= Load(g_Gl.Finish, "glFinish");
     ok &= Load(g_Gl.GetError, "glGetError");
-    ok &= Load(g_Gl.PointSize, "glPointSize");
     ok &= Load(g_Gl.LineWidth, "glLineWidth");
     ok &= Load(g_Gl.Uniform4ui, "glUniform4ui");
     ok &= Load(g_Gl.Uniform1ui, "glUniform1ui");
@@ -150,7 +163,35 @@ bool LoadGl()
     }
 
     g_Loaded = ok;
+    if (ok)
+    {
+        g_Anisotropy = !NativeGl::Es || NativeGl::HasExtension("GL_EXT_texture_filter_anisotropic");
+    }
+
     return ok;
+}
+
+void DrawNone(Gl& gl)
+{
+    if (gl.DrawBuffer != nullptr)
+    {
+        gl.DrawBuffer(GL_NONE);
+    }
+    else
+    {
+        const GLenum none = GL_NONE;
+        gl.DrawBuffers(1, &none);
+    }
+}
+
+bool IsEs()
+{
+    return NativeGl::Es;
+}
+
+bool HasAnisotropy()
+{
+    return g_Anisotropy;
 }
 
 Gl& GetGl()

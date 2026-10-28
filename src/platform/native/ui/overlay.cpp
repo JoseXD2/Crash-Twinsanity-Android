@@ -37,6 +37,19 @@ std::once_flag g_FontsLoaded;
 
 bool ReadFile(const std::string& path, std::vector<unsigned char>* out)
 {
+#if defined(__ANDROID__)
+    // The APK's assets (a relative path is one, to SDL): fonts/...
+    size_t size = 0;
+    void* data = SDL_LoadFile(path.c_str(), &size);
+    if (data == nullptr)
+    {
+        return false;
+    }
+
+    out->assign(static_cast<const unsigned char*>(data), static_cast<const unsigned char*>(data) + size);
+    SDL_free(data);
+    return !out->empty();
+#else
     std::ifstream file(path, std::ios::binary);
     if (!file)
     {
@@ -45,6 +58,7 @@ bool ReadFile(const std::string& path, std::vector<unsigned char>* out)
 
     out->assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
     return !out->empty();
+#endif
 }
 
 void LoadFonts()
@@ -57,6 +71,8 @@ void LoadFonts()
     }
 
     folders.push_back("native/third_party/fonts/");
+    // Android: the APK's assets
+    folders.push_back("fonts/");
     if (const char* base = SDL_GetBasePath(); base != nullptr)
     {
         folders.push_back(std::string(base) + "../Resources/fonts/");
