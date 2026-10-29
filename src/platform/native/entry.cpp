@@ -241,6 +241,13 @@ int main(int argc, char** argv)
     {
         setenv("TWIN_GS_NO_PAGE_WRITE", "1", 0);
     }
+
+    // And direct_texture_off.txt keeps textures read from render targets going through memory's copy (hwgs.cpp's
+    // TWIN_HW_DIRECT_TEXTURE)
+    if (std::ifstream(Native::SettingsFolder() + "/direct_texture_off.txt").good())
+    {
+        setenv("TWIN_HW_DIRECT_TEXTURE", "0", 0);
+    }
 #endif
 #if defined(_WIN32)
     SetUpLog();
