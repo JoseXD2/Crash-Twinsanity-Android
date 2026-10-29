@@ -32,6 +32,9 @@ endif()
 find_package(SDL3 REQUIRED CONFIG)
 # OpenGL ES 3.0 (Android; on Linux for testing the ES path on Mesa) instead of OpenGL 3.3 core: src/platform/native/graphics/glcompat.h
 option(TWIN_GLES "Draw with OpenGL ES 3.0 rather than OpenGL 3.3" ${ANDROID})
+# Vulkan (native/VULKAN.md): the loader is opened at run time through SDL, so nothing links against it; the build only needs
+# <vulkan/vulkan.h> (the NDK's sysroot has it; Linux: libvulkan-dev). Off where the headers aren't there (Windows' LLVM-MinGW)
+option(TWIN_VULKAN "Build the Vulkan graphics (the probe and, as it comes, the renderer)" ${ANDROID})
 if(NOT TWIN_GLES)
     find_package(OpenGL REQUIRED)
 endif()
@@ -151,6 +154,9 @@ list(TRANSFORM REUSED_PS2 PREPEND ${ROOT}/)
 set(RETAIL_SOURCES ${REUSED_PS2})
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ROOT}/native/reused_ps2.txt)
 file(GLOB_RECURSE PLATFORM_SOURCES CONFIGURE_DEPENDS ${ROOT}/src/platform/native/*.cpp)
+if(NOT TWIN_VULKAN)
+    list(FILTER PLATFORM_SOURCES EXCLUDE REGEX "/graphics/vk/")
+endif()
 # The version the log's first line names (entry.cpp alone, so a new version compiles one file again)
 set_source_files_properties(${ROOT}/src/platform/native/entry.cpp PROPERTIES
     COMPILE_DEFINITIONS "TWIN_PORT_VERSION=\"${PROJECT_VERSION}\"")
@@ -280,6 +286,9 @@ endif()
 foreach(target game twinsanity)
 target_include_directories(${target} PRIVATE ${ROOT}/native/include ${ROOT}/include ${ROOT}/src/platform/native)
 target_compile_definitions(${target} PRIVATE TWIN_NATIVE)
+if(TWIN_VULKAN)
+    target_compile_definitions(${target} PRIVATE TWIN_VULKAN)
+endif()
 # What the PS2 build's flags keep of the retail code's behaviour: no fused multiply-adds (the R5900 has none the game's code
 # uses), no assumptions about aliasing, null checks or signed overflow the retail compiler didn't make. A float made an integer
 # out of the integer's range saturates, as the R5900's conversion and arm64's do (x86-64's own gives 0x80000000 either way):

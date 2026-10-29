@@ -6,6 +6,9 @@
 #include "platform/saves.h"
 #include "platform/system.h"
 #include "ui/nativeui.h"
+#if defined(TWIN_VULKAN)
+#include "graphics/vk/vkdevice.h"
+#endif
 
 #include <SDL3/SDL.h>
 #if defined(__ANDROID__)
@@ -50,6 +53,46 @@ void StartLowMemory();
 namespace
 {
 // --selftest-lowmemory: the retail code's kinds of low accesses done once each, which must go on with the PS2's results
+#if defined(TWIN_VULKAN)
+int SelfTestVulkan()
+{
+    std::string report;
+    if (!NativeVulkan::Probe(&report))
+    {
+        std::fprintf(stderr, "vulkan self-test: the probe failed:\n%s", report.c_str());
+        return 1;
+    }
+
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
+    {
+        std::fprintf(stderr, "vulkan self-test: SDL's video didn't start: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN;
+#if defined(__ANDROID__)
+    flags |= SDL_WINDOW_FULLSCREEN;
+#endif
+    SDL_Window* window = SDL_CreateWindow("Crash Twinsanity (Vulkan test)", 1280, 720, flags);
+    if (window == nullptr)
+    {
+        std::fprintf(stderr, "vulkan self-test: no window: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    std::string error;
+    const bool ok = NativeVulkan::ClearTest(window, 120, &error);
+    if (!ok)
+    {
+        std::fprintf(stderr, "vulkan self-test: the swapchain test failed: %s\n", error.c_str());
+    }
+
+    SDL_DestroyWindow(window);
+    std::fprintf(stderr, "vulkan self-test: %s\n", ok ? "passed" : "FAILED");
+    return ok ? 0 : 1;
+}
+#endif
+
 int SelfTestLowMemory()
 {
     g_NativeLowMemory[0x10] = 0x5A;
@@ -241,6 +284,16 @@ int main(int argc, char** argv)
     {
         setenv("TWIN_GS_NO_PAGE_WRITE", "1", 0);
     }
+
+#if defined(TWIN_VULKAN)
+    // What the phone's Vulkan offers, to the log, before the game starts as usual (native/VULKAN.md; the vulkan branch: the
+    // report is what the renderer's design is decided on). vulkan_probe_off.txt in the settings folder skips it
+    if (!std::ifstream(Native::SettingsFolder() + "/vulkan_probe_off.txt").good())
+    {
+        std::string report;
+        NativeVulkan::Probe(&report);
+    }
+#endif
 #endif
 #if defined(_WIN32)
     SetUpLog();
@@ -272,6 +325,14 @@ int main(int argc, char** argv)
         {
             return SelfTestLowMemory();
         }
+#if defined(TWIN_VULKAN)
+        // --selftest-vulkan: the Vulkan probe (the device's name and what it offers, to the log) and the swapchain test on a
+        // window of its own: 120 frames cleared blue to orange (native/VULKAN.md)
+        if (std::string_view(argv[i]) == "--selftest-vulkan")
+        {
+            return SelfTestVulkan();
+        }
+#endif
         if (std::string_view(argv[i]) == "--selftest-saves")
         {
             return SelfTestSaves();
