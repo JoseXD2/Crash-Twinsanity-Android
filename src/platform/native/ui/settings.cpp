@@ -224,7 +224,7 @@ void Build()
             resolution.scale = value + 1;
             SetResolution(resolution);
         },
-        ScaleChoices - 1, [](s32 value) {
+        ScaleChoicesHere - 1, [](s32 value) {
             // The scale and the picture's size it draws at (the PAL frame's 640 x 512 times it): "2×  ·  1280 × 1024"
             s32 scale = value + 1;
             return Text(TextScale1 + static_cast<u32>(value)) + "  \xB7  " + std::to_string(640 * scale) + "x" +

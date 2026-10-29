@@ -92,6 +92,12 @@ enum TargetClass : u32
 };
 
 
+// (the statistics': whether a texture format reads the CLUT)
+bool indexedForStats(u32 psm)
+{
+    return psm == Gs::PSMT8 || psm == Gs::PSMT4 || psm == Gs::PSMT8H || psm == Gs::PSMT4HL || psm == Gs::PSMT4HH;
+}
+
 u32 ClassOf(u32 psm)
 {
     switch (psm)
@@ -2696,6 +2702,37 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
 
     if (anyStale)
     {
+        // (TWIN_HW_STATS: the textures decoded from pages a target holds, with the target's format, every 200: the pairs of
+        // formats a direct read of the target would have to convert)
+        static const bool counting = std::getenv("TWIN_HW_STATS") != nullptr;
+        if (counting && (needed & newestMask_).any())
+        {
+            static std::map<std::string, u64> counts;
+            static u64 total = 0;
+            const Target* from = nullptr;
+            for (u32 page = 0; page < Gs::PageCount && from == nullptr; page++)
+            {
+                if (needed.test(page) && newestMask_.test(page))
+                {
+                    from = newest_[page];
+                }
+            }
+
+            char detail[160];
+            std::snprintf(detail, sizeof(detail), "texture %x/%u psm %x %ux%u (%s, cpsm %x) from target %x/%u psm %x (%u pages) for frame %x/%u psm %x",
+                          base.bp, base.bw, base.psm, base.width, base.height, whole ? "whole" : "region", indexedForStats(base.psm) ? static_cast<u32>(tex0.cpsm) : 0,
+                          from != nullptr ? from->bp : 0, from != nullptr ? from->bw : 0, from != nullptr ? from->psm : 0,
+                          static_cast<u32>((needed & newestMask_).count()), state.fbp, state.fbw, state.fpsm);
+            counts[detail]++;
+            if (++total % 200 == 0)
+            {
+                for (auto& entry : counts)
+                {
+                    std::fprintf(stderr, "decodes from targets: %llu %s\n", static_cast<unsigned long long>(entry.second), entry.first.c_str());
+                }
+            }
+        }
+
         // The pages current in memory's copy, then the stale tiles' rectangles decoded from it into the texture's own
         ScopedNs timed(stats.decodeNs);
         Flush();

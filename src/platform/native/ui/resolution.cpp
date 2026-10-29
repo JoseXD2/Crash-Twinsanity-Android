@@ -34,8 +34,8 @@ static_assert(DisplayChoices - 1 == sizeof(Windows) / sizeof(Windows[0]));
 constexpr s32 FullscreenChoice = DisplayChoices - 1;
 // The defaults (nativeui.h's DefaultResolution): the platform's window is made at their size (system.cpp)
 #if defined(__ANDROID__)
-// Android: the PS2's own resolution (a phone's GPU and the readbacks the renderer makes are slower than a PC's)
-constexpr Resolution Defaults = {1, 1280, 720, true};
+// Android: 2x (1280x1024, about a phone's screen; the choices stop at 3x, nativeui.h's ScaleChoicesHere)
+constexpr Resolution Defaults = {2, 1280, 720, true};
 #else
 constexpr Resolution Defaults = {2, 1280, 720, false};
 #endif
@@ -71,7 +71,7 @@ bool ReadSaved(Resolution* resolution)
         int b = 0;
         if (std::sscanf(line.c_str(), "scale=%d", &a) == 1)
         {
-            read.scale = Clamp(a, 1, ScaleChoices);
+            read.scale = Clamp(a, 1, ScaleChoicesHere);
             any = true;
         }
         else if (std::sscanf(line.c_str(), "window=%dx%d", &a, &b) == 2 && a > 0 && b > 0)
@@ -139,7 +139,7 @@ Resolution CurrentResolution()
                 NativeGraphicsGetResolution(&scale, &width, &height, &fullscreen);
             }
 
-            g_Current = {Clamp(scale, 1, ScaleChoices), width > 0 ? width : Defaults.windowWidth,
+            g_Current = {Clamp(scale, 1, ScaleChoicesHere), width > 0 ? width : Defaults.windowWidth,
                          height > 0 ? height : Defaults.windowHeight, fullscreen};
         }
 
@@ -164,7 +164,7 @@ Resolution CurrentResolution()
 
 s32 ScaleChoice(const Resolution& resolution)
 {
-    return Clamp(resolution.scale, 1, ScaleChoices) - 1;
+    return Clamp(resolution.scale, 1, ScaleChoicesHere) - 1;
 }
 
 s32 DisplayChoice(const Resolution& resolution)
@@ -196,7 +196,7 @@ Resolution FromChoices(s32 scaleChoice, s32 displayChoice)
 {
     Resolution current = CurrentResolution();
     Resolution resolution = current;
-    resolution.scale = Clamp(scaleChoice, 0, ScaleChoices - 1) + 1;
+    resolution.scale = Clamp(scaleChoice, 0, ScaleChoicesHere - 1) + 1;
     displayChoice = Clamp(displayChoice, 0, FullscreenChoice);
     if (displayChoice == FullscreenChoice)
     {

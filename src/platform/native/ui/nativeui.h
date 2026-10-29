@@ -263,6 +263,13 @@ enum GameTextId : u32
 // ----------------------------------------------------------------------------------------------------------------- resolution
 // The render scale (1 to 4 times the PS2's picture) and the display modes: windows of fixed sizes, then fullscreen
 constexpr s32 ScaleChoices = 4;
+// How many of them a phone offers: up to 3x (1920x1536, taller than any phone's screen; 4x costs a phone's GPU 19-20 ms a frame
+// where 3x fits in a 60 Hz frame)
+#if defined(__ANDROID__)
+constexpr s32 ScaleChoicesHere = 3;
+#else
+constexpr s32 ScaleChoicesHere = ScaleChoices;
+#endif
 constexpr s32 DisplayChoices = TextFullscreen - TextWindow960 + 1;
 
 struct Resolution
