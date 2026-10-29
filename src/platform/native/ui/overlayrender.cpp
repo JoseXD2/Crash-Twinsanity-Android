@@ -857,6 +857,17 @@ void StartOverlay()
     NativeGraphicsSetOverlay(OverlayHook);
 }
 
+void DrawOverlayCommands(const std::vector<OverlayFrame::Command>& commands, int pixelWidth, int pixelHeight)
+{
+    DrawFrame(commands, pixelWidth, pixelHeight);
+}
+
+void ForgetOverlayRenderer()
+{
+    // (the context it was made in is gone: its names mean nothing; the next context makes everything again)
+    g_Renderer = Renderer();
+}
+
 bool RenderFrameOffscreen(u32 width, u32 height, std::vector<u32>* pixels)
 {
     // A hidden window's context and a framebuffer of the size (the window is never shown)

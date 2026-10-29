@@ -7,6 +7,7 @@
 // mouse (hover, click, the wheel, the tabs and the arrows, a slider dragged) while it's open; the game reads nothing meanwhile
 #include "ui/settingsmodel.h"
 #include "ui/overlay.h"
+#include "ui/touch.h"
 
 #include "native.h"
 
@@ -154,6 +155,7 @@ void SetVibration(s32 value)
 }
 
 void OpenScreenPosition();
+void StartTouchEditor();
 void SelectTab(u32 tab);
 void AskPortable(bool portable);
 
@@ -269,19 +271,42 @@ void Build()
     audio.push_back(Toggle(TextMuteInactive, TextDescMuteInactive, OptionMuteInactive));
 
     std::vector<Row>& controls = g_Rows[TabControls];
+    // A phone's touch controls first: shown at all, their size and opacity, where each sits (the layout editor) and that put back
+    if (TouchControlsEnabled())
+    {
+        controls.push_back(Toggle(TextTouchControls, TextDescTouchControls, OptionTouchControls));
+        Row touchSize = OptionSlider(TextTouchSize, TextDescTouchSize, OptionTouchSize, 5, 15);
+        touchSize.shown = [] { return IsOn(OptionTouchControls); };
+        controls.push_back(touchSize);
+        Row touchOpacity = OptionSlider(TextTouchOpacity, TextDescTouchOpacity, OptionTouchOpacity, 1, 10);
+        touchOpacity.shown = [] { return IsOn(OptionTouchControls); };
+        controls.push_back(touchOpacity);
+        Row touchEdit = Action(TextTouchEdit, TextDescTouchEdit, [] { StartTouchEditor(); });
+        touchEdit.shown = [] { return IsOn(OptionTouchControls); };
+        controls.push_back(touchEdit);
+        Row touchReset = Action(TextTouchReset, TextDescTouchReset, [] { ResetTouchLayout(); });
+        touchReset.shown = [] { return IsOn(OptionTouchControls); };
+        controls.push_back(touchReset);
+    }
+
     controls.push_back(OptionChoice(TextController, TextDescController, OptionController,
                                     {TextAutomatic, TextKeyboard, TextXbox, TextPlayStation, TextSwitch}));
     Row layout = OptionChoice(TextNintendoLayout, TextDescLayout, OptionNintendoLayout, {TextPositional, TextNintendo});
     layout.shown = [] { return CurrentPromptStyle() == PromptSwitch; };
     controls.push_back(layout);
     controls.push_back(OptionChoice(TextMenuHints, TextDescMenuHints, OptionMenuHints, {TextHintsOriginal, TextHintsBar}));
-    controls.push_back(Toggle(TextMouse, TextDescMouse, OptionMouse));
-    controls.push_back(Toggle(TextMouseLook, TextDescMouseLook, OptionMouseLook));
+    // The mouse's (none on a phone: the touches are the menus' pointer there, and the camera is the touch controls')
+    Row mouse = Toggle(TextMouse, TextDescMouse, OptionMouse);
+    mouse.shown = [] { return !Native::IsMobile(); };
+    controls.push_back(mouse);
+    Row mouseLook = Toggle(TextMouseLook, TextDescMouseLook, OptionMouseLook);
+    mouseLook.shown = [] { return !Native::IsMobile(); };
+    controls.push_back(mouseLook);
     Row sensitivity = OptionSlider(TextMouseSensitivity, TextDescMouseSensitivity, OptionMouseSensitivity, 1, 10);
-    sensitivity.shown = [] { return IsOn(OptionMouseLook); };
+    sensitivity.shown = [] { return !Native::IsMobile() && IsOn(OptionMouseLook); };
     controls.push_back(sensitivity);
     Row invertMouse = Toggle(TextInvertMouseY, TextDescInvertMouseY, OptionInvertMouseY);
-    invertMouse.shown = [] { return IsOn(OptionMouseLook); };
+    invertMouse.shown = [] { return !Native::IsMobile() && IsOn(OptionMouseLook); };
     controls.push_back(invertMouse);
 
     std::vector<Row>& access = g_Rows[TabAccessibility];
@@ -347,6 +372,8 @@ std::chrono::steady_clock::time_point g_FlashStart;
 // The screen to show again when it's closed
 u32 g_ReturnScreen = 0;
 bool g_ScreenPosition = false;
+// The touch controls' layout editor over the paused game (touch.cpp draws it and takes its touches; back ends it here)
+bool g_TouchEditing = false;
 // A display change waiting to be kept (the revert countdown: display mode and window size only)
 bool g_Keeping = false;
 Resolution g_KeepPrevious = {};
@@ -868,6 +895,12 @@ void Close()
     oleg.Show(oleg.screens[g_ReturnScreen], fade, 0);
 }
 
+void StartTouchEditor()
+{
+    g_TouchEditing = true;
+    BeginTouchLayoutEdit(Text(TextDescTouchEdit), Text(TextDone), Text(TextTouchReset));
+}
+
 void OpenScreenPosition()
 {
     // The game's own screen position page (its back comes here again: ScreenPositionClosed)
@@ -1096,6 +1129,27 @@ void TakeDialogInput()
 void TakeInput()
 {
     std::vector<Row>& rows = g_Rows[g_Tab];
+    // The touch layout's editor: its panel's done (touch.cpp) or back and select here end it; the list takes nothing meanwhile
+    if (g_TouchEditing)
+    {
+        if (!TouchLayoutEditing())
+        {
+            g_TouchEditing = false;
+        }
+        else if (Took(UiBack) || Took(UiConfirm) || g_MouseRightClicked)
+        {
+            EndTouchLayoutEdit();
+            g_TouchEditing = false;
+        }
+
+        g_Actions = 0;
+        g_MouseClicked = false;
+        g_MouseRightClicked = false;
+        g_MouseMoved = false;
+        g_Wheel = 0;
+        return;
+    }
+
     if (g_Capturing)
     {
         if (g_CapturedKey >= 0 || g_CapturedButton >= 0)
@@ -1502,7 +1556,12 @@ void DrawAfterOleg(Renderer*)
     if (g_Open)
     {
         g_Regions.clear();
-        DrawSettingsView(frame, g_Regions);
+        // (the touch layout's editor draws over the paused game itself: touch.cpp's controls and panel)
+        if (!g_TouchEditing)
+        {
+            DrawSettingsView(frame, g_Regions);
+        }
+
         for (const HitRegion& region : g_Regions)
         {
             overClickable = overClickable || region.Contains(mouseX, mouseY);

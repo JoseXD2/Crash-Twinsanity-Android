@@ -43,6 +43,10 @@ void OverlayFontMetrics(OverlayFont face, f32 size, f32* ascent, f32* descent, f
 std::u32string GameTextCodepoints(const std::string& gameText);
 std::vector<OverlayFrame::Command> SubmittedFrame();
 void NoteWindow(int pixelWidth, int pixelHeight, float pixelScale);
+// Commands drawn now in the current GL context over a window of these pixels (the launcher's, before the presenter is there), and
+// the renderer made again in the next context it draws in (the launcher's context destroyed)
+void DrawOverlayCommands(const std::vector<OverlayFrame::Command>& commands, int pixelWidth, int pixelHeight);
+void ForgetOverlayRenderer();
 void ReferenceMapping(f32 pixelWidth, f32 pixelHeight, f32* scale, f32* offsetX, f32* offsetY);
 // The cursor's art: the Xbox disc's Wumpa fruit (RGBA, red the low byte), none without the disc
 bool CursorArt(std::vector<u32>* pixels, s32* width, s32* height);

@@ -73,6 +73,9 @@ constexpr OptionInfo Infos[OptionCount] = {
 #else
     {OptionShowFps, "show_fps", 0, 1},
 #endif
+    {OptionTouchControls, "touch_controls", 1, 1},
+    {OptionTouchSize, "touch_size", 10, 15},
+    {OptionTouchOpacity, "touch_opacity", 6, 10},
 };
 
 s32 g_Values[OptionCount];
@@ -220,6 +223,19 @@ s32 DefaultOption(Option option)
 s32 GetOption(Option option)
 {
     Read();
+#if defined(__ANDROID__)
+    // A phone has no mouse: the touches are the menus' pointer (SDL's mouse events made from them), and the mouse look stays off
+    // (a drag is the touch controls' camera); the controls page doesn't show either
+    if (option == OptionMouse)
+    {
+        return 1;
+    }
+
+    if (option == OptionMouseLook)
+    {
+        return 0;
+    }
+#endif
     return g_Values[option];
 }
 

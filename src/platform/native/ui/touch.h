@@ -1,10 +1,13 @@
 #pragma once
 
-// The touch controls (Android, or $TWIN_TOUCH=1 elsewhere): a floating left stick in the left part of the screen, the face
-// buttons, the shoulders, start and select drawn over the picture (touch.cpp draws them through the overlay), and the right
-// stick as a drag anywhere else in the right part. What they give is added to the pad's read (pads.cpp)
+// The touch controls (Android, or $TWIN_TOUCH=1 elsewhere): a floating left stick, the face buttons, the shoulders, start and
+// select drawn over the picture (touch.cpp draws them through the overlay), and the right stick as a drag anywhere free on the
+// other side of the screen from the stick. What they give is added to the pad's read (pads.cpp). Their size and opacity are
+// options (Controls: OptionTouchSize, OptionTouchOpacity); where each sits and its own size are the layout editor's, kept in
+// touch_layout.txt in the settings folder
 #include "common.h"
 
+#include <string>
 #include <vector>
 
 #include "ui/overlay.h"
@@ -24,4 +27,13 @@ void StartTouchControls();
 void ReadTouchControls(BoundPad* pad);
 // The controls drawn (overlayrender.cpp, after the frame's commands)
 void AddTouchControls(std::vector<OverlayFrame::Command>* commands, int pixelWidth, int pixelHeight);
+
+// The layout editor (the settings' controls page, "edit layout"): the controls drawn over the paused game, a finger on one drags it,
+// a second finger pinches it bigger or smaller, the panel's done and reset buttons. The texts are the game's (the settings give
+// them in the game's language). Done (the button, or the settings' back) keeps the layout
+void BeginTouchLayoutEdit(const std::string& hint, const std::string& done, const std::string& reset);
+bool TouchLayoutEditing();
+void EndTouchLayoutEdit();
+// Every control back where it was at first, at the size the option gives (kept)
+void ResetTouchLayout();
 }

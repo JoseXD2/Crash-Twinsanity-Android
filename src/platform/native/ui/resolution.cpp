@@ -34,7 +34,7 @@ static_assert(DisplayChoices - 1 == sizeof(Windows) / sizeof(Windows[0]));
 constexpr s32 FullscreenChoice = DisplayChoices - 1;
 // The defaults (nativeui.h's DefaultResolution): the platform's window is made at their size (system.cpp)
 #if defined(__ANDROID__)
-// Android: 2x (1280x1024, about a phone's screen; the choices stop at 3x, nativeui.h's ScaleChoicesHere)
+// Android: 2x (1280x1024, about a phone's screen; up to 4x in Options > Display)
 constexpr Resolution Defaults = {2, 1280, 720, true};
 #else
 constexpr Resolution Defaults = {2, 1280, 720, false};

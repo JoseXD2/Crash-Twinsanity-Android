@@ -237,6 +237,26 @@ enum NativeText : u32
     TextPortableRefused,
     TextPortableFailed,
     TextOk,
+    // The touch controls' settings (settings.cpp's controls page on a phone) and their layout editor (touch.cpp)
+    TextTouchControls,
+    TextTouchSize,
+    TextTouchOpacity,
+    TextTouchEdit,
+    TextTouchReset,
+    TextDescTouchControls,
+    TextDescTouchSize,
+    TextDescTouchOpacity,
+    TextDescTouchEdit,
+    TextDescTouchReset,
+    TextDone,
+    // The launcher (launcher.cpp: the disc image chosen before the game starts)
+    TextLauncherDisc,
+    TextLauncherNone,
+    TextLauncherChoose,
+    TextLauncherPlay,
+    TextLauncherQuit,
+    TextLauncherHint,
+    TextLauncherReady,
     NativeTextEnd,
 };
 
@@ -263,13 +283,9 @@ enum GameTextId : u32
 // ----------------------------------------------------------------------------------------------------------------- resolution
 // The render scale (1 to 4 times the PS2's picture) and the display modes: windows of fixed sizes, then fullscreen
 constexpr s32 ScaleChoices = 4;
-// How many of them a phone offers: up to 3x (1920x1536, taller than any phone's screen; 4x costs a phone's GPU 19-20 ms a frame
-// where 3x fits in a 60 Hz frame)
-#if defined(__ANDROID__)
-constexpr s32 ScaleChoicesHere = 3;
-#else
+// How many of them this build offers: all of them (a phone too: 4x costs one's GPU more than 3x, 19-20 ms a frame against 12-16 on a
+// Mali-G720, but it's the player's choice; 2x is the phone's default)
 constexpr s32 ScaleChoicesHere = ScaleChoices;
-#endif
 constexpr s32 DisplayChoices = TextFullscreen - TextWindow960 + 1;
 
 struct Resolution
@@ -372,6 +388,11 @@ enum Option : u32
     OptionMenuHints,
     // A frames per second counter in the window's top left corner (fpscounter.cpp)
     OptionShowFps,
+    // The touch controls (touch.cpp; a phone's, or $TWIN_TOUCH=1): shown at all, their size (5-15: 50% to 150%) and their
+    // opacity (1-10, 6 the first look); where each sits and its own size are touch_layout.txt's (the layout editor's)
+    OptionTouchControls,
+    OptionTouchSize,
+    OptionTouchOpacity,
     OptionCount,
 };
 

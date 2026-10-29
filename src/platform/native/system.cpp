@@ -5,6 +5,7 @@
 #include "graphics/window.h"
 #include "native.h"
 #include "ui/nativeui.h"
+#include "ui/launcher.h"
 #include "platform/io.h"
 #include "platform/memory.h"
 #include "platform/sound.h"
@@ -327,6 +328,40 @@ void Tell(SDL_MessageBoxFlags kind, const std::string& message)
     }
 }
 
+// The window the game is shown in, at the defaults' size (resolution.cpp; a saved size is applied once it's there), made once: the
+// launcher's first when there is one (its screen is drawn on it), else the start-up's; the graphics make their context on it
+SDL_Window* g_Window = nullptr;
+
+SDL_Window* GameWindow()
+{
+    if (g_Window != nullptr)
+    {
+        return g_Window;
+    }
+
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
+    {
+        Native::Fatal("SDL's video didn't start: %s", SDL_GetError());
+    }
+
+    const NativeUi::Resolution defaults = NativeUi::DefaultResolution();
+    SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#if defined(__ANDROID__)
+    // The whole screen, landscape
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    flags |= SDL_WINDOW_FULLSCREEN;
+#endif
+    // The context's kind before the window: its surface's configuration is chosen then (EGL)
+    NativeGl::SetContextAttributes();
+    g_Window = SDL_CreateWindow("Crash Twinsanity", defaults.windowWidth, defaults.windowHeight, flags);
+    if (g_Window == nullptr)
+    {
+        Native::Fatal("the window couldn't be made: %s", SDL_GetError());
+    }
+
+    return g_Window;
+}
+
 [[noreturn]] void DiscImageFatal(const std::string& message)
 {
     Tell(SDL_MESSAGEBOX_ERROR, message);
@@ -414,6 +449,28 @@ void Native::OpenDiscImage()
     // Portable mode: with none remembered (or the one remembered gone or wrong) the program's folder is looked in first, and an image
     // found there is used without asking
     bool searchable = askable && PortableMode();
+    // The launcher's screen (Android's start): the image remembered shown and checked, another chosen, play or quit
+    if (askable && !g_Settings.headless && NativeUi::LauncherWanted())
+    {
+        std::string chosen;
+        auto check = [](const std::string& candidate)
+        {
+            // (a disc checked before is closed first: the check opens the one given)
+            Native::Disc::Close();
+            return CheckDiscImage(candidate);
+        };
+        if (!NativeUi::RunLauncher(GameWindow(), image, check, [] { return PickDiscImage(); }, &chosen))
+        {
+            Log("the launcher was quit");
+            SDL_Quit();
+            std::exit(0);
+        }
+
+        g_DiscImage = chosen;
+        Log("disc image %s", chosen.c_str());
+        return;
+    }
+
     std::string problem;
     for (;;)
     {
@@ -613,26 +670,7 @@ void Platform::System::Initialise()
     // graphics make their context on it
     if (!Native::GetSettings().headless)
     {
-        if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
-        {
-            Native::Fatal("SDL's video didn't start: %s", SDL_GetError());
-        }
-
-        const NativeUi::Resolution defaults = NativeUi::DefaultResolution();
-        SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-#if defined(__ANDROID__)
-        // The whole screen, landscape
-        SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
-        flags |= SDL_WINDOW_FULLSCREEN;
-#endif
-        // The context's kind before the window: its surface's configuration is chosen then (EGL)
-        NativeGl::SetContextAttributes();
-        SDL_Window* window = SDL_CreateWindow("Crash Twinsanity", defaults.windowWidth, defaults.windowHeight, flags);
-        if (window == nullptr)
-        {
-            Native::Fatal("the window couldn't be made: %s", SDL_GetError());
-        }
-
+        SDL_Window* window = GameWindow();
         NativeGraphicsAttachWindow(window);
         // Portable mode's first start: its progress dialog goes once the window is there
         Native::EndPortableStart();

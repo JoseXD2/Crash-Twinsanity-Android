@@ -1,7 +1,9 @@
 package org.twinsanity.app;
 
 import android.content.Intent;
+import android.database.Cursor;
 import android.net.Uri;
+import android.provider.OpenableColumns;
 import android.os.Bundle;
 import android.view.View;
 import android.view.WindowManager;
@@ -37,6 +39,26 @@ public class TwinsanityActivity extends SDLActivity
         }
 
         super.startActivityForResult(intent, requestCode);
+    }
+
+    /**
+     * A document's name as the picker shows it, for the launcher (src/platform/native/ui/launcher.cpp, through JNI): the content://
+     * URI the game keeps says nothing a player would recognise. Null when there's none.
+     */
+    public String displayName(String uri)
+    {
+        try (Cursor cursor = getContentResolver().query(Uri.parse(uri), new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null))
+        {
+            if (cursor != null && cursor.moveToFirst())
+            {
+                return cursor.getString(0);
+            }
+        }
+        catch (Exception ignored)
+        {
+        }
+
+        return null;
     }
 
     @Override
