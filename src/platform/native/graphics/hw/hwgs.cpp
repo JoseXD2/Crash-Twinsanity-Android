@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <array>
 #include <memory>
@@ -196,6 +197,9 @@ struct Target
     u32 width = 0;
     u32 height = 0;
     u32 scale = 1;
+    // Drawn by sprites only so far (the game's copies and conversions of its buffers: kept at the PS2's resolution until a
+    // triangle draws into it, or it's shown)
+    bool spritesOnly = false;
     // Pages laid out as rectangles (its base at a page's start)
     bool aligned = false;
     GLuint texture = 0;
@@ -1307,7 +1311,11 @@ public:
     HardwareStats stats = {};
 
 private:
-    Target* TargetFor(u32 bp, u32 bw, u32 psm, u32 height, bool frame = false);
+    Target* TargetFor(u32 bp, u32 bw, u32 psm, u32 height, bool frame = false, bool sprite = false, u32 scale = 0);
+    // A target drawn by sprites only, at the PS2's resolution, made again at the picture's (a triangle draws into it, it's shown)
+    Target* Promote(Target* target, u32 scale);
+    // The scale a buffer of a width is drawn at: the picture's, or the PS2's for the narrow ones under native scaling
+    u32 ScaleFor(u32 bw) const { return (nativeSmall_ && bw < 8) ? 1 : scale_; }
     void DestroyTarget(Target* target);
     void ProcessWrites();
     void Download(Target* target);
@@ -1403,6 +1411,8 @@ private:
     std::vector<Rect> batchRects_;
     // Stencil buffers for the destination alpha test of draws without a depth buffer, by colour target
     std::map<Target*, std::unique_ptr<Target>> scratchStencils_;
+    // The depth buffer each colour target was last drawn with (Flush: the batches without a depth test draw with it attached)
+    std::map<Target*, Target*> lastDepthFor_;
     GLuint dateProgram_ = 0;
     // GS local memory on the GPU, the layouts' tables (32, 16, 16S, 8, 4 bit), the passes between it and the targets
     GLuint memTexture_ = 0;
@@ -1493,10 +1503,33 @@ private:
         {
             passCounts_[cause]++;
             TimePass(cause);
+            if (passFrames_ % 300 == 240)
+            {
+                // (one frame in 300: the order of its passes, with the batch's target and size for the draws, and each one's
+                // GPU time once it's known, a second later)
+                char text[96];
+                if (std::strcmp(cause, "draw") == 0 && key_.colour != nullptr)
+                {
+                    std::snprintf(text, sizeof(text), "draw[%x/%u%s %zuv]", key_.colour->bp, key_.colour->bw, key_.depth != nullptr ? "+z" : "",
+                                  vertexes_.size());
+                }
+                else
+                {
+                    std::snprintf(text, sizeof(text), "%s", cause);
+                }
+
+                passSequence_.push_back({text, queryNext_ - 1});
+            }
         }
 
         passIdentity_ = identity;
     }
+    struct SequencedPass
+    {
+        std::string text;
+        u32 query;
+    };
+    std::vector<SequencedPass> passSequence_;
     // The GPU's time in each pass (TWIN_HW_STATS, with the timer queries): a query begun as a pass starts and ended as the next
     // does, its result read a second later with the pass counts (never waited for: a late one is left out)
     static constexpr u32 QueryRing = 8192;
@@ -1563,6 +1596,15 @@ private:
             GLuint64 time = 0;
             gl.GetQueryObjectui64v(queries_[index], 0x8866, &time);
             nanoseconds[queryCauses_[index]] += time;
+            for (SequencedPass& pass : passSequence_)
+            {
+                if (pass.query == queryReported_)
+                {
+                    char text[32];
+                    std::snprintf(text, sizeof(text), " %.2f", static_cast<double>(time) / 1e6);
+                    pass.text += text;
+                }
+            }
         }
     }
     GLuint clutTexture_ = 0;
@@ -1936,7 +1978,18 @@ void HwGs::ReadDepth(GLuint depthTexture, GLsizei width, GLsizei height, void* t
     }
 }
 
-Target* HwGs::TargetFor(u32 bp, u32 bw, u32 psm, u32 height, bool frame)
+Target* HwGs::Promote(Target* target, u32 scale)
+{
+    const u32 bp = target->bp;
+    const u32 bw = target->bw;
+    const u32 cls = target->cls;
+    const u32 height = target->height;
+    DestroyTarget(target);
+    // (its class again: the stored format as a frame's gives a colour class back, as a buffer's a depth class)
+    return TargetFor(bp, bw, StoredPsm(cls), height, !IsDepthClass(cls), false, scale);
+}
+
+Target* HwGs::TargetFor(u32 bp, u32 bw, u32 psm, u32 height, bool frame, bool sprite, u32 scale)
 {
     u32 cls = frame ? FrameClassOf(psm) : ClassOf(psm);
     s32 pageWidth = 0;
@@ -1972,7 +2025,17 @@ Target* HwGs::TargetFor(u32 bp, u32 bw, u32 psm, u32 height, bool frame)
     // Native scaling: buffers narrower than the screen (the effects' half resolution buffers) stay at the PS2's resolution and
     // are filtered up where the scene reads them, as PCSX2's native scaling does (their sub-pixels would otherwise pick up the
     // frame's pixel patterns)
-    t.scale = (nativeSmall_ && bw < 8) ? 1 : scale_;
+    t.scale = scale != 0 ? scale : ScaleFor(bw);
+    // Native scaling too for a buffer a sprite is the first to draw into (the game converts and copies its textures and
+    // buffers by sprites into memory it calls a frame: upscaled, each such pass would be as big as the picture), as long as
+    // no triangle draws into it and it isn't shown ($TWIN_HW_NO_NATIVE_SPRITES: never)
+    static const bool nativeSprites = std::getenv("TWIN_HW_NO_NATIVE_SPRITES") == nullptr;
+    if (scale == 0 && sprite && nativeSprites && nativeSmall_ && frame && t.scale > 1)
+    {
+        t.scale = 1;
+        t.spritesOnly = true;
+    }
+
     t.aligned = (bp % 32) == 0;
     t.pixels.resize(Gs::PageCount);
     t.rects.assign(Gs::PageCount, Rect{0x7FFF, 0x7FFF, -1, -1});
@@ -2028,6 +2091,11 @@ Target* HwGs::TargetFor(u32 bp, u32 bw, u32 psm, u32 height, bool frame)
 void HwGs::DestroyTarget(Target* target)
 {
     Flush();
+    for (auto it = lastDepthFor_.begin(); it != lastDepthFor_.end();)
+    {
+        it = (it->first == target || it->second == target) ? lastDepthFor_.erase(it) : std::next(it);
+    }
+
     {
         Gs::PageSet mine;
         for (u32 page = 0; page < Gs::PageCount; page++)
@@ -3318,6 +3386,35 @@ void HwGs::ProcessWrites()
         return;
     }
 
+    // (TWIN_HW_STATS: the targets' pages the CPU's writes invalidate, every 2000 pages)
+    static const bool counting = std::getenv("TWIN_HW_STATS") != nullptr;
+    if (counting)
+    {
+        static std::map<std::string, u64> counts;
+        static u64 total = 0;
+        for (auto& target : targets_)
+        {
+            const size_t hit = (written & target->pages & target->valid).count();
+            if (hit != 0)
+            {
+                char detail[96];
+                std::snprintf(detail, sizeof(detail), "written %x/%u class %u: %zu pages", target->bp, target->bw, target->cls, hit);
+                counts[detail]++;
+                total += hit;
+            }
+        }
+
+        static u64 reported = 0;
+        if (total - reported >= 2000)
+        {
+            reported = total;
+            for (auto& entry : counts)
+            {
+                std::fprintf(stderr, "invalidations: %llu %s\n", static_cast<unsigned long long>(entry.second), entry.first.c_str());
+            }
+        }
+    }
+
     last_.pagesKnown = false;
     newestMask_ &= ~written;
     memStale_ |= written;
@@ -4237,7 +4334,13 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
     // As tall as the primitive draws (a scissor taller than the buffer, as the game's full screen passes set, would make the
     // target run over the buffers past it)
     const u32 height = static_cast<u32>(rect.bottom + 1);
-    Target* colour = TargetFor(state.fbp, state.fbw, state.fpsm, height, true);
+    Target* colour = TargetFor(state.fbp, state.fbw, state.fpsm, height, true, state.type == Gs::PrimSprite);
+    if (colour->spritesOnly && state.type != Gs::PrimSprite && colour->scale != ScaleFor(colour->bw))
+    {
+        // A triangle into a buffer sprites alone had drawn: the picture's resolution from here on
+        colour = Promote(colour, ScaleFor(colour->bw));
+    }
+
     u32 highestZ = 0;
     for (u32 i = 0; i < count; i++)
     {
@@ -4245,7 +4348,22 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
     }
 
     nextDepthHigh_ = highestZ >= 0x80000000u;
-    Target* depth = depthUsed ? TargetFor(state.zbp, state.fbw, state.zpsm, height) : nullptr;
+    // (the depth buffer at the colour buffer's scale: they're drawn together)
+    Target* depth = depthUsed ? TargetFor(state.zbp, state.fbw, state.zpsm, height, false, false, colour->scale) : nullptr;
+    if (depth != nullptr && depth->scale != colour->scale)
+    {
+        // (always up: a buffer drawn with a depth buffer of the picture's resolution is of it too, from here on)
+        if (depth->scale > colour->scale)
+        {
+            colour = Promote(colour, depth->scale);
+            n = static_cast<s32>(colour->scale);
+        }
+        else
+        {
+            depth = Promote(depth, colour->scale);
+        }
+    }
+
     nextDepthHigh_ = false;
     n = static_cast<s32>(colour->scale);
     if (static_cast<u32>(rect.right) >= colour->width)
@@ -5272,7 +5390,25 @@ void HwGs::Flush()
         Resolve(k.colour);
     }
 
+    // A batch without a depth test drawn into the same framebuffer as the batches with one (the colour with its depth buffer
+    // attached, the test off): on a tiled GPU a framebuffer of its own would start a pass of its own, loading and storing
+    // the whole picture again (a sprite over the scene cost as much as the scene) ($TWIN_HW_SEPARATE_PASSES: its own)
     Target* depthStencil = k.depth;
+    static const bool separate = std::getenv("TWIN_HW_SEPARATE_PASSES") != nullptr;
+    if (depthStencil == nullptr && !separate)
+    {
+        auto last = lastDepthFor_.find(k.colour);
+        if (last != lastDepthFor_.end() && last->second->scale == k.colour->scale && last->second->width >= k.colour->width &&
+            last->second->height >= k.colour->height)
+        {
+            depthStencil = last->second;
+        }
+    }
+    else if (depthStencil != nullptr)
+    {
+        lastDepthFor_[k.colour] = depthStencil;
+    }
+
     if (k.stencilDate && depthStencil == nullptr)
     {
         depthStencil = ScratchStencil(k.colour);
@@ -5731,6 +5867,18 @@ bool HwGs::DisplayTexture(NativeGraphics::DisplayTexture* display, Target** show
         std::fprintf(stderr, "\n");
         passCounts_.clear();
     }
+
+    if (!passSequence_.empty() && passFrames_ % 300 == 0)
+    {
+        std::string sequence;
+        for (const SequencedPass& pass : passSequence_)
+        {
+            sequence += " " + pass.text + ";";
+        }
+
+        std::fprintf(stderr, "sequence (ms):%s\n", sequence.c_str());
+        passSequence_.clear();
+    }
     ProcessWrites();
     for (auto& t : targets_)
     {
@@ -5813,6 +5961,12 @@ bool HwGs::DisplayTexture(NativeGraphics::DisplayTexture* display, Target** show
         if (c.target == nullptr)
         {
             return false;
+        }
+
+        if (c.target->spritesOnly && c.target->scale != ScaleFor(c.target->bw))
+        {
+            // Shown: the picture's resolution from here on (this frame's picture is what memory holds, at the PS2's)
+            c.target = Promote(c.target, ScaleFor(c.target->bw));
         }
 
         if (fb.dby + c.height > c.target->height)

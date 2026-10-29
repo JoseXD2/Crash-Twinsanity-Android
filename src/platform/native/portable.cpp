@@ -63,7 +63,8 @@ std::string Native::DiscImageFromSetting(const std::string& line)
 {
     // A path relative to the program's folder (one kept in portable mode): not "C:x" or "\x", which are the drive's
     fs::path path = FromUtf8(line);
-    if (line.empty() || g_Program.empty() || path.has_root_name() || path.has_root_directory())
+    // (a content URI, Android's picked document, is no path at all)
+    if (line.empty() || g_Program.empty() || path.has_root_name() || path.has_root_directory() || line.find("://") != std::string::npos)
     {
         return line;
     }
