@@ -951,61 +951,75 @@ void main()
 // memory word, the word's units in the target's own layout (its inverse table) become its pixels, read at their GS sample
 // point and made the GS's bits as MemFromTargetSource makes them; other pages come from memory's copy as usual
 constexpr const char* TargetReadSource = R"(
-uniform sampler2D target;
-uniform usampler2D invT;
-uniform int unitsPerBlockT;
-uniform int unitShiftT;
-uniform int unitBitsT;
-uniform int pageWidthT;
-uniform int pageHeightT;
-uniform int pagesAcrossT;
-uniform int pagesDownT;
-uniform int basePointerT;
-uniform int xorZT;
-uniform int targetScale;
-uniform int targetStorage;
-uniform int targetReverse;
-uniform uint targetPages[16];
-bool TargetUnitPixel(uint address, out ivec2 p)
+uniform sampler2D target0;
+uniform sampler2D target1;
+uniform sampler2D target2;
+uniform usampler2D invT0;
+uniform usampler2D invT1;
+uniform usampler2D invT2;
+uniform int unitsPerBlockT[3];
+uniform int unitShiftT[3];
+uniform int unitBitsT[3];
+uniform int pageWidthT[3];
+uniform int pageHeightT[3];
+uniform int pagesAcrossT[3];
+uniform int pagesDownT[3];
+uniform int basePointerT[3];
+uniform int xorZT[3];
+uniform int targetScale[3];
+uniform int targetStorage[3];
+uniform int targetReverse[3];
+// Two bits a page: 0 memory's copy, 1-3 the target (less one) that holds the page newest
+uniform uint pageOwner[32];
+uint InvT(int t, uint i)
 {
-    uint block = address / uint(unitsPerBlockT);
-    uint inBlock = address % uint(unitsPerBlockT);
-    if (xorZT != 0)
+    ivec2 at = ivec2(int(i & 1023u), int(i >> 10));
+    return t == 0 ? texelFetch(invT0, at, 0).r : t == 1 ? texelFetch(invT1, at, 0).r : texelFetch(invT2, at, 0).r;
+}
+vec4 TargetTexel(int t, ivec2 p)
+{
+    return t == 0 ? texelFetch(target0, p, 0) : t == 1 ? texelFetch(target1, p, 0) : texelFetch(target2, p, 0);
+}
+bool TargetUnitPixel(int t, uint address, out ivec2 p)
+{
+    uint block = address / uint(unitsPerBlockT[t]);
+    uint inBlock = address % uint(unitsPerBlockT[t]);
+    if (xorZT[t] != 0)
     {
         block ^= 24u;
     }
 
-    uint rel = (block - uint(basePointerT)) & 16383u;
+    uint rel = (block - uint(basePointerT[t])) & 16383u;
     uint page = rel >> 5;
-    if (page >= uint(pagesAcrossT * pagesDownT))
+    if (page >= uint(pagesAcrossT[t] * pagesDownT[t]))
     {
         return false;
     }
 
-    uint i = (rel & 31u) * uint(unitsPerBlockT) + inBlock;
-    uint v = texelFetch(invT, ivec2(int(i & 1023u), int(i >> 10)), 0).r;
-    p = ivec2(int(page % uint(pagesAcrossT)) * pageWidthT + int(v & 0xFFFFu), int(page / uint(pagesAcrossT)) * pageHeightT + int(v >> 16));
+    uint i = (rel & 31u) * uint(unitsPerBlockT[t]) + inBlock;
+    uint v = InvT(t, i);
+    p = ivec2(int(page % uint(pagesAcrossT[t])) * pageWidthT[t] + int(v & 0xFFFFu), int(page / uint(pagesAcrossT[t])) * pageHeightT[t] + int(v >> 16));
     return true;
 }
-uint TargetUnit(uint address)
+uint TargetUnit(int t, uint address)
 {
     ivec2 p;
-    if (!TargetUnitPixel(address, p))
+    if (!TargetUnitPixel(t, address, p))
     {
         return 0u;
     }
 
-    vec4 c = texelFetch(target, p * targetScale, 0);
-    if (targetStorage == 2)
+    vec4 c = TargetTexel(t, p * targetScale[t]);
+    if (targetStorage[t] == 2)
     {
         float z = floor(c.r * 4294967296.0 + 0.5);
         uint v = uint(min(z, 4294967040.0));
-        v = targetReverse != 0 ? 0xFFFFFFFFu - v : v;
-        return unitBitsT == 32 ? v : v & 0xFFFFu;
+        v = targetReverse[t] != 0 ? 0xFFFFFFFFu - v : v;
+        return unitBitsT[t] == 32 ? v : v & 0xFFFFu;
     }
 
     uvec4 b = uvec4(floor(c * 255.0 + 0.5));
-    if (targetStorage == 0)
+    if (targetStorage[t] == 0)
     {
         return b.r | b.g << 8 | b.b << 16 | b.a << 24;
     }
@@ -1015,16 +1029,18 @@ uint TargetUnit(uint address)
 uint WordAt(uint w)
 {
     uint page = w >> 11;
-    if ((targetPages[page >> 5] & (1u << (page & 31u))) == 0u)
+    uint owner = (pageOwner[page >> 4] >> ((page & 15u) * 2u)) & 3u;
+    if (owner == 0u)
     {
         return texelFetch(mem, ivec2(int(w & 1023u), int(w >> 10)), 0).r;
     }
 
-    uint units = 1u << uint(unitShiftT);
+    int t = int(owner) - 1;
+    uint units = 1u << uint(unitShiftT[t]);
     uint value = 0u;
     for (uint k = 0u; k < units; k++)
     {
-        value |= TargetUnit((w << uint(unitShiftT)) | k) << (k * uint(unitBitsT));
+        value |= TargetUnit(t, (w << uint(unitShiftT[t])) | k) << (k * uint(unitBitsT[t]));
     }
 
     return value;
@@ -1358,9 +1374,10 @@ struct GpuTexture
     GLuint shown = 0;
     // Shown from the content cache: good while every page is older than this and no target holds a newer copy (0: not)
     u32 contentEpoch = 0;
-    // Decoded straight from a target's pixels (not memory's copy): which, and its content version then
-    const Target* fromTarget = nullptr;
-    u32 fromTargetVersion = 0;
+    // Decoded straight from targets' pixels (not memory's copy): which (up to three), and their content versions then
+    const Target* fromTargets[3] = {};
+    u32 fromVersions[3] = {};
+    u32 fromCount = 0;
     std::vector<u16> pageList;
 };
 
@@ -1769,8 +1786,11 @@ private:
     // Replacement images' textures, made once each
     std::map<NativeGraphics::ReplacementKey, GLuint> replacementTextures_;
     GLuint DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 right, s32 bottom);
-    // (from: the target whose pixels stand in for memory's copy of the pages it holds newest; null: memory's copy alone)
-    void DecodePasses(const Gs::Gs::DrawState& state, GLuint texture, const Rect* rects, u32 levels, const Target* from = nullptr);
+    // (from: up to DirectTargets targets whose pixels stand in for memory's copy of the pages they hold newest, fromCount of
+    // them; 0: memory's copy alone)
+    static constexpr u32 DirectTargets = 3;
+    void DecodePasses(const Gs::Gs::DrawState& state, GLuint texture, const Rect* rects, u32 levels, const Target* const* from = nullptr,
+                      u32 fromCount = 0);
     u64 ContentHash(const Gs::Gs::DrawState& state);
     GLuint MakeLevels(const Gs::Gs::DrawState& state);
     std::unordered_map<u64, ContentTexture> contents_;
@@ -2248,10 +2268,14 @@ void HwGs::DestroyTarget(Target* target)
     // The textures decoded straight from it: decoded again next time (another target could take its address)
     for (auto& entry : gpuTextures_)
     {
-        if (entry.second.fromTarget == target)
+        for (u32 f = 0; f < entry.second.fromCount; f++)
         {
-            entry.second.fromTarget = nullptr;
-            entry.second.complete = false;
+            if (entry.second.fromTargets[f] == target)
+            {
+                entry.second.fromCount = 0;
+                entry.second.complete = false;
+                break;
+            }
         }
     }
 
@@ -2776,11 +2800,24 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
                 {
                     u32 tile = static_cast<u32>(ty) * L.tilesWide + static_cast<u32>(tx);
                     u32 page = L.tilePage[tile];
-                    if (L.tileEpoch[tile] != 0 && L.tileEpoch[tile] > pageEpoch_[page] &&
-                        (!newestMask_.test(page) ||
-                         (t.fromTarget != nullptr && newest_[page] == t.fromTarget && t.fromTarget->contentVersion == t.fromTargetVersion)))
+                    if (L.tileEpoch[tile] != 0 && L.tileEpoch[tile] > pageEpoch_[page])
                     {
-                        continue;
+                        if (!newestMask_.test(page))
+                        {
+                            continue;
+                        }
+
+                        // Newest in a target it was decoded from, whose content hasn't changed since
+                        bool same = false;
+                        for (u32 f = 0; f < t.fromCount && !same; f++)
+                        {
+                            same = newest_[page] == t.fromTargets[f] && t.fromTargets[f]->contentVersion == t.fromVersions[f];
+                        }
+
+                        if (same)
+                        {
+                            continue;
+                        }
                     }
 
                     anyStale = true;
@@ -2903,36 +2940,50 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
 
         ScopedNs timed(stats.decodeNs);
         Flush();
-        // The pages a target holds newest: read from the target's pixels in the decode itself when one target holds them all
-        // and its storage is one the read knows (32 and 16 bit colour, 32 bit depth), instead of converting it into memory's
-        // copy first; the pages memory holds are made current as usual. $TWIN_HW_DIRECT_TEXTURE=0 keeps the conversion
-        static const bool directWanted = std::getenv("TWIN_HW_DIRECT_TEXTURE") == nullptr || std::getenv("TWIN_HW_DIRECT_TEXTURE")[0] != '0';
-        Target* from = nullptr;
-        bool oneTarget = true;
+        // The pages targets hold newest: read from the targets' pixels in the decode itself (up to three targets, any storage),
+        // instead of converting them into memory's copy first; the pages memory holds are made current as usual. Off unless
+        // $TWIN_HW_DIRECT_TEXTURE=1: on a Mali-G720 (ANGLE) the read cost more GPU time than the conversion and the decode it
+        // replaced (the layout's inverse mapping is done a texel at a time, twice for 16 bit targets, where the conversion does
+        // it once a word), and the frame was no shorter
+        static const bool directWanted = std::getenv("TWIN_HW_DIRECT_TEXTURE") != nullptr && std::getenv("TWIN_HW_DIRECT_TEXTURE")[0] == '1';
+        Target* from[DirectTargets] = {};
+        u32 fromCount = 0;
+        bool tooMany = false;
+        bool textureless = false;
         Gs::PageSet held;
         for (u32 page = 0; page < Gs::PageCount; page++)
         {
             if (needed.test(page) && newestMask_.test(page))
             {
                 Target* holder = newest_[page];
-                if (from == nullptr)
+                u32 t = 0;
+                while (t < fromCount && from[t] != holder)
                 {
-                    from = holder;
+                    t++;
                 }
-                else if (holder != from)
+
+                if (t == fromCount)
                 {
-                    oneTarget = false;
+                    if (fromCount == DirectTargets)
+                    {
+                        tooMany = true;
+                    }
+                    else
+                    {
+                        from[fromCount++] = holder;
+                        textureless = textureless || holder->texture == 0;
+                    }
                 }
 
                 held.set(page);
             }
         }
 
-        const bool direct = directWanted && from != nullptr && oneTarget && from->texture != 0 &&
-                            (from->cls == ClassColour32 || from->cls == ClassColour16 || from->cls == ClassColour16S || from->cls == ClassDepth32);
+        const bool oneTarget = !tooMany;
+        const bool direct = directWanted && fromCount != 0 && !tooMany && !textureless;
         // (TWIN_HW_STATS: the decodes that still go through memory's copy, and why, every 200)
         static const bool countingDirect = std::getenv("TWIN_HW_STATS") != nullptr;
-        if (countingDirect && from != nullptr && !direct)
+        if (countingDirect && fromCount != 0 && !direct)
         {
             static std::map<std::string, u64> counts;
             static u64 total = 0;
@@ -2955,7 +3006,7 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
 
             char detail[200];
             std::snprintf(detail, sizeof(detail), "texture %x/%u psm %x: %s%s", base.bp, base.bw, base.psm,
-                          !directWanted ? "off" : !oneTarget ? "several targets:" : from->texture == 0 ? "no texture" : "class not read",
+                          !directWanted ? "off" : tooMany ? "more than three targets:" : textureless ? "a target without a texture" : "?",
                           holders.c_str());
             counts[detail]++;
             if (++total % 200 == 0)
@@ -2969,20 +3020,28 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
 
         if (direct)
         {
-            Resolve(from);
-            SyncMem(needed & ~held);
-            if (from->scale > 1)
+            for (u32 i = 0; i < fromCount; i++)
             {
-                scaledPages_ |= held;
-            }
-            else
-            {
-                scaledPages_ &= ~held;
+                Resolve(from[i]);
             }
 
-            DecodePasses(state, t.id, stale, t.levelCount, from);
-            t.fromTarget = from;
-            t.fromTargetVersion = from->contentVersion;
+            SyncMem(needed & ~held);
+            for (u32 page = 0; page < Gs::PageCount; page++)
+            {
+                if (held.test(page))
+                {
+                    scaledPages_.set(page, newest_[page]->scale > 1);
+                }
+            }
+
+            DecodePasses(state, t.id, stale, t.levelCount, from, fromCount);
+            t.fromCount = fromCount;
+            for (u32 i = 0; i < fromCount; i++)
+            {
+                t.fromTargets[i] = from[i];
+                t.fromVersions[i] = from[i]->contentVersion;
+            }
+
             stats.directDecodes++;
         }
         else
@@ -2990,7 +3049,7 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
             // The pages current in memory's copy, then the stale tiles' rectangles decoded from it into the texture's own
             SyncMem(needed);
             DecodePasses(state, t.id, stale, t.levelCount);
-            t.fromTarget = nullptr;
+            t.fromCount = 0;
         }
 
         const u32 decodeEpoch = ++epoch_;
@@ -3159,10 +3218,11 @@ u64 HwGs::ContentHash(const Gs::Gs::DrawState& state)
     return result;
 }
 
-void HwGs::DecodePasses(const Gs::Gs::DrawState& state, GLuint texture, const Rect* rects, u32 levels, const Target* from)
+void HwGs::DecodePasses(const Gs::Gs::DrawState& state, GLuint texture, const Rect* rects, u32 levels, const Target* const* from,
+                        u32 fromCount)
 {
     Gl& gl = GetGl();
-    const GLuint program = from != nullptr ? decodeFromTargetProgram_ : decodeProgram_;
+    const GLuint program = fromCount != 0 ? decodeFromTargetProgram_ : decodeProgram_;
     const Gs::RegTex0& tex0 = state.context->tex0;
     const Gs::TextureLevel& base = state.levels[0];
     const bool indexed = base.psm == Gs::PSMT8 || base.psm == Gs::PSMT4 || base.psm == Gs::PSMT8H || base.psm == Gs::PSMT4HL ||
@@ -3195,50 +3255,75 @@ void HwGs::DecodePasses(const Gs::Gs::DrawState& state, GLuint texture, const Re
 
         const Gs::TextureLevel& lv = state.levels[i];
         gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, static_cast<GLint>(i));
-        Pass((1ull << 40) | (static_cast<u64>(texture) << 4) | i, from != nullptr ? "texture decode from target" : "texture decode");
+        Pass((1ull << 40) | (static_cast<u64>(texture) << 4) | i, fromCount != 0 ? "texture decode from target" : "texture decode");
         gl.Viewport(0, 0, static_cast<GLsizei>(lv.width), static_cast<GLsizei>(lv.height));
         UseLayout(program, lv.psm, lv.bp, lv.bw, 1);
-        if (from != nullptr)
+        if (fromCount != 0)
         {
-            // The target's layout (its inverse table), its pixels, and the pages it stands in for
-            u32 family = 0;
-            bool xorZ = false;
-            LayoutOf(from->psm, &family, &xorZ);
-            const FamilyInfo& info = Families[family];
-            auto uniformT = [&](const char* name) { return gl.GetUniformLocation(program, name); };
-            gl.Uniform1i(uniformT("unitsPerBlockT"), static_cast<GLint>(info.unitsPerBlock));
-            gl.Uniform1i(uniformT("unitShiftT"), static_cast<GLint>(info.unitShift));
-            gl.Uniform1i(uniformT("unitBitsT"), static_cast<GLint>(info.bits));
-            gl.Uniform1i(uniformT("pageWidthT"), static_cast<GLint>(info.pageWidth));
-            gl.Uniform1i(uniformT("pageHeightT"), static_cast<GLint>(info.pageHeight));
-            gl.Uniform1i(uniformT("pagesAcrossT"), static_cast<GLint>(std::max<u32>(info.halfWidth ? from->bw >> 1 : from->bw, 1)));
-            gl.Uniform1i(uniformT("pagesDownT"), static_cast<GLint>(from->height / info.pageHeight));
-            gl.Uniform1i(uniformT("basePointerT"), static_cast<GLint>(from->bp));
-            gl.Uniform1i(uniformT("xorZT"), xorZ ? 1 : 0);
-            gl.Uniform1i(uniformT("targetScale"), static_cast<GLint>(from->scale));
-            gl.Uniform1i(uniformT("targetStorage"), from->depth ? 2 : (Is32Class(from->cls) ? 0 : 1));
-            gl.Uniform1i(uniformT("targetReverse"), from->reversed ? 1 : 0);
-            gl.ActiveTexture(GL_TEXTURE0 + 4);
-            gl.BindTexture(GL_TEXTURE_2D, invTables_[family]);
-            gl.ActiveTexture(GL_TEXTURE0 + 5);
-            gl.BindTexture(GL_TEXTURE_2D, from->texture);
+            // Each target's layout (its inverse table) and pixels, and which target holds each page
+            auto uniformT = [&](const char* name, u32 t)
+            {
+                char indexed[48];
+                std::snprintf(indexed, sizeof(indexed), "%s[%u]", name, t);
+                return gl.GetUniformLocation(program, indexed);
+            };
+            for (u32 t = 0; t < fromCount; t++)
+            {
+                const Target* one = from[t];
+                u32 family = 0;
+                bool xorZ = false;
+                LayoutOf(one->psm, &family, &xorZ);
+                const FamilyInfo& info = Families[family];
+                gl.Uniform1i(uniformT("unitsPerBlockT", t), static_cast<GLint>(info.unitsPerBlock));
+                gl.Uniform1i(uniformT("unitShiftT", t), static_cast<GLint>(info.unitShift));
+                gl.Uniform1i(uniformT("unitBitsT", t), static_cast<GLint>(info.bits));
+                gl.Uniform1i(uniformT("pageWidthT", t), static_cast<GLint>(info.pageWidth));
+                gl.Uniform1i(uniformT("pageHeightT", t), static_cast<GLint>(info.pageHeight));
+                gl.Uniform1i(uniformT("pagesAcrossT", t), static_cast<GLint>(std::max<u32>(info.halfWidth ? one->bw >> 1 : one->bw, 1)));
+                gl.Uniform1i(uniformT("pagesDownT", t), static_cast<GLint>(one->height / info.pageHeight));
+                gl.Uniform1i(uniformT("basePointerT", t), static_cast<GLint>(one->bp));
+                gl.Uniform1i(uniformT("xorZT", t), xorZ ? 1 : 0);
+                gl.Uniform1i(uniformT("targetScale", t), static_cast<GLint>(one->scale));
+                gl.Uniform1i(uniformT("targetStorage", t), one->depth ? 2 : (Is32Class(one->cls) ? 0 : 1));
+                gl.Uniform1i(uniformT("targetReverse", t), one->reversed ? 1 : 0);
+                gl.ActiveTexture(GL_TEXTURE0 + 4 + t);
+                gl.BindTexture(GL_TEXTURE_2D, invTables_[family]);
+                gl.ActiveTexture(GL_TEXTURE0 + 7 + t);
+                gl.BindTexture(GL_TEXTURE_2D, one->texture);
+            }
+
             gl.ActiveTexture(GL_TEXTURE0);
-            gl.Uniform1i(uniformT("invT"), 4);
-            gl.Uniform1i(uniformT("target"), 5);
-            GLuint mask[16] = {};
+            static const char* const invNames[3] = {"invT0", "invT1", "invT2"};
+            static const char* const targetNames[3] = {"target0", "target1", "target2"};
+            for (u32 t = 0; t < DirectTargets; t++)
+            {
+                // (the samplers not used still bound to units of their own kind: the unused ones point at the first's)
+                const u32 use = t < fromCount ? t : 0;
+                gl.Uniform1i(gl.GetUniformLocation(program, invNames[t]), static_cast<GLint>(4 + use));
+                gl.Uniform1i(gl.GetUniformLocation(program, targetNames[t]), static_cast<GLint>(7 + use));
+            }
+
+            GLuint owner[32] = {};
             for (u32 page = 0; page < Gs::PageCount; page++)
             {
-                if (newestMask_.test(page) && newest_[page] == from)
+                if (!newestMask_.test(page))
                 {
-                    mask[page >> 5] |= 1u << (page & 31);
+                    continue;
+                }
+
+                for (u32 t = 0; t < fromCount; t++)
+                {
+                    if (newest_[page] == from[t])
+                    {
+                        owner[page >> 4] |= (t + 1) << ((page & 15) * 2);
+                        break;
+                    }
                 }
             }
 
-            for (u32 j = 0; j < 16; j++)
+            for (u32 j = 0; j < 32; j++)
             {
-                char name[24];
-                std::snprintf(name, sizeof(name), "targetPages[%u]", j);
-                gl.Uniform1ui(uniformT(name), mask[j]);
+                gl.Uniform1ui(uniformT("pageOwner", j), owner[j]);
             }
         }
 
