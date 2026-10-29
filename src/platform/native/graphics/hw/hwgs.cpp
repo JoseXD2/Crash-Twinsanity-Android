@@ -206,6 +206,9 @@ struct Target
     // Drawn by sprites only so far (the game's copies and conversions of its buffers: kept at the PS2's resolution until a
     // triangle draws into it, or it's shown)
     bool spritesOnly = false;
+    // Changed whenever the target's pixels are (a batch drawn into it, memory converted into it): the textures decoded
+    // straight from it (DecodeOnGpu's direct read) are good while it stays
+    u32 contentVersion = 1;
     // Pages laid out as rectangles (its base at a page's start)
     bool aligned = false;
     GLuint texture = 0;
@@ -306,6 +309,47 @@ struct BatchKey
     // The depth test at the GS's sample point (the block's first sample) in the shader: its ZTST, 0 for GL's own test
     u32 nativeDepthTest;
 };
+
+// (TWIN_HW_STATS: which of two keys' fields differ, the first few, as "texture program scissor")
+std::string BatchKeyDifference(const BatchKey& a, const BatchKey& b)
+{
+    std::string text;
+    u32 found = 0;
+    auto field = [&](bool differs, const char* name)
+    {
+        if (differs && found++ < 4)
+        {
+            text += std::string(text.empty() ? "" : " ") + name;
+        }
+    };
+    field(a.colour != b.colour, "colour");
+    field(a.depth != b.depth, "depth");
+    field(a.texture != b.texture, "texture");
+    field(a.primitive != b.primitive, "primitive");
+    field(a.program != b.program, "program");
+    field(a.minFilter != b.minFilter || a.magFilter != b.magFilter || a.anisotropy != b.anisotropy, "filter");
+    field(a.wrapS != b.wrapS || a.wrapT != b.wrapT, "wrap");
+    field(a.maxLevel != b.maxLevel || a.mxl != b.mxl || a.lodK != b.lodK || a.lodL != b.lodL, "mipmap");
+    field(a.texWidth != b.texWidth || a.texHeight != b.texHeight || a.gsTexWidth != b.gsTexWidth || a.gsTexHeight != b.gsTexHeight, "texsize");
+    field(a.blend != b.blend || a.blendEquation != b.blendEquation || a.blendSource != b.blendSource || a.blendDestination != b.blendDestination ||
+              a.blendFix != b.blendFix,
+          "blend");
+    field(a.depthFunc != b.depthFunc || a.depthWrite != b.depthWrite, "depthtest");
+    field(a.colourMask != b.colourMask, "colourmask");
+    field(std::memcmp(a.scissor, b.scissor, sizeof(a.scissor)) != 0, "scissor");
+    field(a.aref != b.aref || a.afail != b.afail || a.alphaTested != b.alphaTested, "alphatest");
+    field(a.fogColour != b.fogColour, "fog");
+    field(a.ta0 != b.ta0 || a.ta1 != b.ta1 || a.aem != b.aem, "texa");
+    field(a.dimx != b.dimx || a.ditherScale != b.ditherScale, "dither");
+    field(a.zMax != b.zMax || a.zMaxU != b.zMaxU || a.depthReverse != b.depthReverse, "zmax");
+    field(std::memcmp(a.gsBlend, b.gsBlend, sizeof(a.gsBlend)) != 0 || a.gsFix != b.gsFix || a.pabe != b.pabe || a.colclamp != b.colclamp, "gsblend");
+    field(std::memcmp(a.frameMask, b.frameMask, sizeof(a.frameMask)) != 0, "framemask");
+    field(a.datm != b.datm || a.stencilDate != b.stencilDate, "date");
+    field(a.wrapAdd != b.wrapAdd, "wrapadd");
+    field(a.texSnap != b.texSnap, "texsnap");
+    field(a.nativeDepthTest != b.nativeDepthTest, "nativedepth");
+    return text.empty() ? "padding?" : text;
+}
 
 // Every primitive builds a key (zeroed, so its padding compares too) and compares it with the batch's: done inline, a word at a
 // time (the C library's memset, memcmp and memcpy calls cost more than the work on Windows' runtime)
@@ -902,6 +946,115 @@ void main()
 
 // A texture level decoded from memory's copy as the software GS decodes it (DecodeTexel: TEXA, the CLUT), into a texture's
 // level: RGBA, the PS2's alpha (0x80 = 1.0) in the bytes
+// The decode's memory read, from a target's pixels for the pages the target holds newest (DecodeOnGpu's direct read, in
+// place of a conversion of the target into memory's copy and the decode from it): the texture's unit address becomes a
+// memory word, the word's units in the target's own layout (its inverse table) become its pixels, read at their GS sample
+// point and made the GS's bits as MemFromTargetSource makes them; other pages come from memory's copy as usual
+constexpr const char* TargetReadSource = R"(
+uniform sampler2D target0;
+uniform sampler2D target1;
+uniform sampler2D target2;
+uniform usampler2D invT0;
+uniform usampler2D invT1;
+uniform usampler2D invT2;
+uniform int unitsPerBlockT[3];
+uniform int unitShiftT[3];
+uniform int unitBitsT[3];
+uniform int pageWidthT[3];
+uniform int pageHeightT[3];
+uniform int pagesAcrossT[3];
+uniform int pagesDownT[3];
+uniform int basePointerT[3];
+uniform int xorZT[3];
+uniform int targetScale[3];
+uniform int targetStorage[3];
+uniform int targetReverse[3];
+// Two bits a page: 0 memory's copy, 1-3 the target (less one) that holds the page newest
+uniform uint pageOwner[32];
+uint InvT(int t, uint i)
+{
+    ivec2 at = ivec2(int(i & 1023u), int(i >> 10));
+    return t == 0 ? texelFetch(invT0, at, 0).r : t == 1 ? texelFetch(invT1, at, 0).r : texelFetch(invT2, at, 0).r;
+}
+vec4 TargetTexel(int t, ivec2 p)
+{
+    return t == 0 ? texelFetch(target0, p, 0) : t == 1 ? texelFetch(target1, p, 0) : texelFetch(target2, p, 0);
+}
+bool TargetUnitPixel(int t, uint address, out ivec2 p)
+{
+    uint block = address / uint(unitsPerBlockT[t]);
+    uint inBlock = address % uint(unitsPerBlockT[t]);
+    if (xorZT[t] != 0)
+    {
+        block ^= 24u;
+    }
+
+    uint rel = (block - uint(basePointerT[t])) & 16383u;
+    uint page = rel >> 5;
+    if (page >= uint(pagesAcrossT[t] * pagesDownT[t]))
+    {
+        return false;
+    }
+
+    uint i = (rel & 31u) * uint(unitsPerBlockT[t]) + inBlock;
+    uint v = InvT(t, i);
+    p = ivec2(int(page % uint(pagesAcrossT[t])) * pageWidthT[t] + int(v & 0xFFFFu), int(page / uint(pagesAcrossT[t])) * pageHeightT[t] + int(v >> 16));
+    return true;
+}
+uint TargetUnit(int t, uint address)
+{
+    ivec2 p;
+    if (!TargetUnitPixel(t, address, p))
+    {
+        return 0u;
+    }
+
+    vec4 c = TargetTexel(t, p * targetScale[t]);
+    if (targetStorage[t] == 2)
+    {
+        float z = floor(c.r * 4294967296.0 + 0.5);
+        uint v = uint(min(z, 4294967040.0));
+        v = targetReverse[t] != 0 ? 0xFFFFFFFFu - v : v;
+        return unitBitsT[t] == 32 ? v : v & 0xFFFFu;
+    }
+
+    uvec4 b = uvec4(floor(c * 255.0 + 0.5));
+    if (targetStorage[t] == 0)
+    {
+        return b.r | b.g << 8 | b.b << 16 | b.a << 24;
+    }
+
+    return (b.r >> 3) | (b.g >> 3) << 5 | (b.b >> 3) << 10 | (b.a >= 128u ? 0x8000u : 0u);
+}
+uint WordAt(uint w)
+{
+    uint page = w >> 11;
+    uint owner = (pageOwner[page >> 4] >> ((page & 15u) * 2u)) & 3u;
+    if (owner == 0u)
+    {
+        return texelFetch(mem, ivec2(int(w & 1023u), int(w >> 10)), 0).r;
+    }
+
+    int t = int(owner) - 1;
+    uint units = 1u << uint(unitShiftT[t]);
+    uint value = 0u;
+    for (uint k = 0u; k < units; k++)
+    {
+        value |= TargetUnit(t, (w << uint(unitShiftT[t])) | k) << (k * uint(unitBitsT[t]));
+    }
+
+    return value;
+}
+uint MemUnitT(uint address)
+{
+    uint w = (address >> uint(unitShift)) & 0xFFFFFu;
+    uint word = WordAt(w);
+    uint sub = address & ((1u << uint(unitShift)) - 1u);
+    uint mask = unitBits == 32 ? 0xFFFFFFFFu : ((1u << uint(unitBits)) - 1u);
+    return (word >> (sub * uint(unitBits))) & mask;
+}
+)";
+
 constexpr const char* DecodeSource = R"(
 uniform int psm;
 uniform usampler2D clut;
@@ -1221,6 +1374,10 @@ struct GpuTexture
     GLuint shown = 0;
     // Shown from the content cache: good while every page is older than this and no target holds a newer copy (0: not)
     u32 contentEpoch = 0;
+    // Decoded straight from targets' pixels (not memory's copy): which (up to three), and their content versions then
+    const Target* fromTargets[3] = {};
+    u32 fromVersions[3] = {};
+    u32 fromCount = 0;
     std::vector<u16> pageList;
 };
 
@@ -1455,6 +1612,8 @@ private:
     u64 lastTextureGeneration_ = 0;
     u32 lastTextureClut_ = 0;
     GLuint decodeProgram_ = 0;
+    // The decode reading a target's pixels where the target holds the pages newest (TWIN_HW_DIRECT_TEXTURE)
+    GLuint decodeFromTargetProgram_ = 0;
     GLuint decodeFbo_ = 0;
     // TWIN_HW_STATS: the render passes begun (a draw into another framebuffer or attachment than the last), by cause
     u64 passIdentity_ = 0;
@@ -1627,7 +1786,11 @@ private:
     // Replacement images' textures, made once each
     std::map<NativeGraphics::ReplacementKey, GLuint> replacementTextures_;
     GLuint DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 right, s32 bottom);
-    void DecodePasses(const Gs::Gs::DrawState& state, GLuint texture, const Rect* rects, u32 levels);
+    // (from: up to DirectTargets targets whose pixels stand in for memory's copy of the pages they hold newest, fromCount of
+    // them; 0: memory's copy alone)
+    static constexpr u32 DirectTargets = 3;
+    void DecodePasses(const Gs::Gs::DrawState& state, GLuint texture, const Rect* rects, u32 levels, const Target* const* from = nullptr,
+                      u32 fromCount = 0);
     u64 ContentHash(const Gs::Gs::DrawState& state);
     GLuint MakeLevels(const Gs::Gs::DrawState& state);
     std::unordered_map<u64, ContentTexture> contents_;
@@ -2102,6 +2265,20 @@ void HwGs::DestroyTarget(Target* target)
         it = (it->first == target || it->second == target) ? lastDepthFor_.erase(it) : std::next(it);
     }
 
+    // The textures decoded straight from it: decoded again next time (another target could take its address)
+    for (auto& entry : gpuTextures_)
+    {
+        for (u32 f = 0; f < entry.second.fromCount; f++)
+        {
+            if (entry.second.fromTargets[f] == target)
+            {
+                entry.second.fromCount = 0;
+                entry.second.complete = false;
+                break;
+            }
+        }
+    }
+
     {
         Gs::PageSet mine;
         for (u32 page = 0; page < Gs::PageCount; page++)
@@ -2393,6 +2570,19 @@ void HwGs::InitMemory()
                                    false);
     decodeProgram_ = LinkProgram(CompileShader(GL_VERTEX_SHADER, MemRectVertexSource),
                                  CompileShader(GL_FRAGMENT_SHADER, header + MemCommonSource + DecodeSource), false);
+    {
+        // The same decode reading the target's pixels for its pages (TargetReadSource's MemUnitT in MemUnit's place)
+        std::string direct = DecodeSource;
+        const std::string from = "uint v = MemUnit(UnitAddress(p));";
+        const size_t at = direct.find(from);
+        if (at != std::string::npos)
+        {
+            direct.replace(at, from.size(), "uint v = MemUnitT(UnitAddress(p));");
+        }
+
+        decodeFromTargetProgram_ = LinkProgram(CompileShader(GL_VERTEX_SHADER, MemRectVertexSource),
+                                               CompileShader(GL_FRAGMENT_SHADER, header + MemCommonSource + TargetReadSource + direct), false);
+    }
     gl.GenFramebuffers(1, &decodeFbo_);
     gl.GenTextures(1, &clutTexture_);
     gl.BindTexture(GL_TEXTURE_2D, clutTexture_);
@@ -2610,9 +2800,24 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
                 {
                     u32 tile = static_cast<u32>(ty) * L.tilesWide + static_cast<u32>(tx);
                     u32 page = L.tilePage[tile];
-                    if (L.tileEpoch[tile] != 0 && L.tileEpoch[tile] > pageEpoch_[page] && !newestMask_.test(page))
+                    if (L.tileEpoch[tile] != 0 && L.tileEpoch[tile] > pageEpoch_[page])
                     {
-                        continue;
+                        if (!newestMask_.test(page))
+                        {
+                            continue;
+                        }
+
+                        // Newest in a target it was decoded from, whose content hasn't changed since
+                        bool same = false;
+                        for (u32 f = 0; f < t.fromCount && !same; f++)
+                        {
+                            same = newest_[page] == t.fromTargets[f] && t.fromTargets[f]->contentVersion == t.fromVersions[f];
+                        }
+
+                        if (same)
+                        {
+                            continue;
+                        }
                     }
 
                     anyStale = true;
@@ -2733,11 +2938,120 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
             }
         }
 
-        // The pages current in memory's copy, then the stale tiles' rectangles decoded from it into the texture's own
         ScopedNs timed(stats.decodeNs);
         Flush();
-        SyncMem(needed);
-        DecodePasses(state, t.id, stale, t.levelCount);
+        // The pages targets hold newest: read from the targets' pixels in the decode itself (up to three targets, any storage),
+        // instead of converting them into memory's copy first; the pages memory holds are made current as usual. Off unless
+        // $TWIN_HW_DIRECT_TEXTURE=1: on a Mali-G720 (ANGLE) the read cost more GPU time than the conversion and the decode it
+        // replaced (the layout's inverse mapping is done a texel at a time, twice for 16 bit targets, where the conversion does
+        // it once a word), and the frame was no shorter
+        static const bool directWanted = std::getenv("TWIN_HW_DIRECT_TEXTURE") != nullptr && std::getenv("TWIN_HW_DIRECT_TEXTURE")[0] == '1';
+        Target* from[DirectTargets] = {};
+        u32 fromCount = 0;
+        bool tooMany = false;
+        bool textureless = false;
+        Gs::PageSet held;
+        for (u32 page = 0; page < Gs::PageCount; page++)
+        {
+            if (needed.test(page) && newestMask_.test(page))
+            {
+                Target* holder = newest_[page];
+                u32 t = 0;
+                while (t < fromCount && from[t] != holder)
+                {
+                    t++;
+                }
+
+                if (t == fromCount)
+                {
+                    if (fromCount == DirectTargets)
+                    {
+                        tooMany = true;
+                    }
+                    else
+                    {
+                        from[fromCount++] = holder;
+                        textureless = textureless || holder->texture == 0;
+                    }
+                }
+
+                held.set(page);
+            }
+        }
+
+        const bool oneTarget = !tooMany;
+        const bool direct = directWanted && fromCount != 0 && !tooMany && !textureless;
+        // (TWIN_HW_STATS: the decodes that still go through memory's copy, and why, every 200)
+        static const bool countingDirect = std::getenv("TWIN_HW_STATS") != nullptr;
+        if (countingDirect && fromCount != 0 && !direct)
+        {
+            static std::map<std::string, u64> counts;
+            static u64 total = 0;
+            std::string holders;
+            if (!oneTarget)
+            {
+                for (u32 page = 0; page < Gs::PageCount; page++)
+                {
+                    if (held.test(page))
+                    {
+                        char one[32];
+                        std::snprintf(one, sizeof(one), " %x/%u/%x", newest_[page]->bp, newest_[page]->bw, newest_[page]->psm);
+                        if (holders.find(one) == std::string::npos)
+                        {
+                            holders += one;
+                        }
+                    }
+                }
+            }
+
+            char detail[200];
+            std::snprintf(detail, sizeof(detail), "texture %x/%u psm %x: %s%s", base.bp, base.bw, base.psm,
+                          !directWanted ? "off" : tooMany ? "more than three targets:" : textureless ? "a target without a texture" : "?",
+                          holders.c_str());
+            counts[detail]++;
+            if (++total % 200 == 0)
+            {
+                for (auto& entry : counts)
+                {
+                    std::fprintf(stderr, "not direct: %llu %s\n", static_cast<unsigned long long>(entry.second), entry.first.c_str());
+                }
+            }
+        }
+
+        if (direct)
+        {
+            for (u32 i = 0; i < fromCount; i++)
+            {
+                Resolve(from[i]);
+            }
+
+            SyncMem(needed & ~held);
+            for (u32 page = 0; page < Gs::PageCount; page++)
+            {
+                if (held.test(page))
+                {
+                    scaledPages_.set(page, newest_[page]->scale > 1);
+                }
+            }
+
+            DecodePasses(state, t.id, stale, t.levelCount, from, fromCount);
+            t.fromCount = fromCount;
+            for (u32 i = 0; i < fromCount; i++)
+            {
+                t.fromTargets[i] = from[i];
+                t.fromVersions[i] = from[i]->contentVersion;
+            }
+
+            stats.directDecodes++;
+        }
+        else
+        {
+            // The pages current in memory's copy, then the stale tiles' rectangles decoded from it into the texture's own
+            SyncMem(needed);
+            DecodePasses(state, t.id, stale, t.levelCount);
+            t.fromCount = 0;
+        }
+
         const u32 decodeEpoch = ++epoch_;
         for (u32 i = 0; i < t.levelCount; i++)
         {
@@ -2904,9 +3218,11 @@ u64 HwGs::ContentHash(const Gs::Gs::DrawState& state)
     return result;
 }
 
-void HwGs::DecodePasses(const Gs::Gs::DrawState& state, GLuint texture, const Rect* rects, u32 levels)
+void HwGs::DecodePasses(const Gs::Gs::DrawState& state, GLuint texture, const Rect* rects, u32 levels, const Target* const* from,
+                        u32 fromCount)
 {
     Gl& gl = GetGl();
+    const GLuint program = fromCount != 0 ? decodeFromTargetProgram_ : decodeProgram_;
     const Gs::RegTex0& tex0 = state.context->tex0;
     const Gs::TextureLevel& base = state.levels[0];
     const bool indexed = base.psm == Gs::PSMT8 || base.psm == Gs::PSMT4 || base.psm == Gs::PSMT8H || base.psm == Gs::PSMT4HL ||
@@ -2939,15 +3255,84 @@ void HwGs::DecodePasses(const Gs::Gs::DrawState& state, GLuint texture, const Re
 
         const Gs::TextureLevel& lv = state.levels[i];
         gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, static_cast<GLint>(i));
-        Pass((1ull << 40) | (static_cast<u64>(texture) << 4) | i, "texture decode");
+        Pass((1ull << 40) | (static_cast<u64>(texture) << 4) | i, fromCount != 0 ? "texture decode from target" : "texture decode");
         gl.Viewport(0, 0, static_cast<GLsizei>(lv.width), static_cast<GLsizei>(lv.height));
-        UseLayout(decodeProgram_, lv.psm, lv.bp, lv.bw, 1);
+        UseLayout(program, lv.psm, lv.bp, lv.bw, 1);
+        if (fromCount != 0)
+        {
+            // Each target's layout (its inverse table) and pixels, and which target holds each page
+            auto uniformT = [&](const char* name, u32 t)
+            {
+                char indexed[48];
+                std::snprintf(indexed, sizeof(indexed), "%s[%u]", name, t);
+                return gl.GetUniformLocation(program, indexed);
+            };
+            for (u32 t = 0; t < fromCount; t++)
+            {
+                const Target* one = from[t];
+                u32 family = 0;
+                bool xorZ = false;
+                LayoutOf(one->psm, &family, &xorZ);
+                const FamilyInfo& info = Families[family];
+                gl.Uniform1i(uniformT("unitsPerBlockT", t), static_cast<GLint>(info.unitsPerBlock));
+                gl.Uniform1i(uniformT("unitShiftT", t), static_cast<GLint>(info.unitShift));
+                gl.Uniform1i(uniformT("unitBitsT", t), static_cast<GLint>(info.bits));
+                gl.Uniform1i(uniformT("pageWidthT", t), static_cast<GLint>(info.pageWidth));
+                gl.Uniform1i(uniformT("pageHeightT", t), static_cast<GLint>(info.pageHeight));
+                gl.Uniform1i(uniformT("pagesAcrossT", t), static_cast<GLint>(std::max<u32>(info.halfWidth ? one->bw >> 1 : one->bw, 1)));
+                gl.Uniform1i(uniformT("pagesDownT", t), static_cast<GLint>(one->height / info.pageHeight));
+                gl.Uniform1i(uniformT("basePointerT", t), static_cast<GLint>(one->bp));
+                gl.Uniform1i(uniformT("xorZT", t), xorZ ? 1 : 0);
+                gl.Uniform1i(uniformT("targetScale", t), static_cast<GLint>(one->scale));
+                gl.Uniform1i(uniformT("targetStorage", t), one->depth ? 2 : (Is32Class(one->cls) ? 0 : 1));
+                gl.Uniform1i(uniformT("targetReverse", t), one->reversed ? 1 : 0);
+                gl.ActiveTexture(GL_TEXTURE0 + 4 + t);
+                gl.BindTexture(GL_TEXTURE_2D, invTables_[family]);
+                gl.ActiveTexture(GL_TEXTURE0 + 7 + t);
+                gl.BindTexture(GL_TEXTURE_2D, one->texture);
+            }
+
+            gl.ActiveTexture(GL_TEXTURE0);
+            static const char* const invNames[3] = {"invT0", "invT1", "invT2"};
+            static const char* const targetNames[3] = {"target0", "target1", "target2"};
+            for (u32 t = 0; t < DirectTargets; t++)
+            {
+                // (the samplers not used still bound to units of their own kind: the unused ones point at the first's)
+                const u32 use = t < fromCount ? t : 0;
+                gl.Uniform1i(gl.GetUniformLocation(program, invNames[t]), static_cast<GLint>(4 + use));
+                gl.Uniform1i(gl.GetUniformLocation(program, targetNames[t]), static_cast<GLint>(7 + use));
+            }
+
+            GLuint owner[32] = {};
+            for (u32 page = 0; page < Gs::PageCount; page++)
+            {
+                if (!newestMask_.test(page))
+                {
+                    continue;
+                }
+
+                for (u32 t = 0; t < fromCount; t++)
+                {
+                    if (newest_[page] == from[t])
+                    {
+                        owner[page >> 4] |= (t + 1) << ((page & 15) * 2);
+                        break;
+                    }
+                }
+            }
+
+            for (u32 j = 0; j < 32; j++)
+            {
+                gl.Uniform1ui(uniformT("pageOwner", j), owner[j]);
+            }
+        }
+
         gl.ActiveTexture(GL_TEXTURE0);
         gl.BindTexture(GL_TEXTURE_2D, memTexture_);
         gl.ActiveTexture(GL_TEXTURE0 + 3);
         gl.BindTexture(GL_TEXTURE_2D, clutTexture_);
         gl.ActiveTexture(GL_TEXTURE0);
-        auto uniform = [&](const char* name) { return gl.GetUniformLocation(decodeProgram_, name); };
+        auto uniform = [&](const char* name) { return gl.GetUniformLocation(program, name); };
         gl.Uniform1i(uniform("mem"), 0);
         gl.Uniform1i(uniform("clut"), 3);
         gl.Uniform1i(uniform("psm"), static_cast<GLint>(lv.psm));
@@ -3079,6 +3464,7 @@ void HwGs::TargetFromMem(Target* target, const Gs::PageSet& pages)
     ScopedNs timed(stats.memoryNs);
     Gl& gl = GetGl();
     stats.uploads++;
+    target->contentVersion++;
     TraceConversion("into", target, pages);
     static const bool counting = std::getenv("TWIN_HW_STATS") != nullptr;
     if (counting)
@@ -4925,6 +5311,22 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
     const bool sameKey = batching_ && SameBatchKey(key, key_);
     if (batching_ && !sameKey)
     {
+        // (TWIN_HW_STATS: why batches end, by the key's fields that changed, every 3000)
+        static const bool counting = std::getenv("TWIN_HW_STATS") != nullptr;
+        if (counting)
+        {
+            static std::map<std::string, u64> counts;
+            static u64 total = 0;
+            counts[BatchKeyDifference(key, key_)]++;
+            if (++total % 3000 == 0)
+            {
+                for (auto& entry : counts)
+                {
+                    std::fprintf(stderr, "batch ends: %llu %s\n", static_cast<unsigned long long>(entry.second), entry.first.c_str());
+                }
+            }
+        }
+
         Flush();
     }
 
@@ -5119,6 +5521,18 @@ void HwGs::AddPrimitive(const Gs::Gs::DrawState& state, const Gs::Vertex* vertex
         {
             if (rect.left <= earlier.right && earlier.left <= rect.right && rect.top <= earlier.bottom && earlier.top <= rect.bottom)
             {
+                // (TWIN_HW_STATS: these ends too, with the key's)
+                static const bool counting = std::getenv("TWIN_HW_STATS") != nullptr;
+                if (counting)
+                {
+                    static u64 overlaps = 0;
+                    if (++overlaps % 1000 == 0)
+                    {
+                        std::fprintf(stderr, "batch ends: %llu shader blend overlap (frame %x/%u, %zu primitives in the batch)\n",
+                                     static_cast<unsigned long long>(overlaps), colour->bp, colour->bw, batchRects_.size());
+                    }
+                }
+
                 Flush();
                 break;
             }
@@ -5416,6 +5830,12 @@ void HwGs::Flush()
     ResolveDeferred();
     stats.batches++;
     const BatchKey& k = key_;
+    k.colour->contentVersion++;
+    if (k.depth != nullptr)
+    {
+        k.depth->contentVersion++;
+    }
+
     Gl& gl = GetGl();
     const GLsizei n = static_cast<GLsizei>(k.colour->scale);
     const GLsizei width = static_cast<GLsizei>(k.colour->width) * n;

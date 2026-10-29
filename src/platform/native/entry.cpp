@@ -285,6 +285,13 @@ int main(int argc, char** argv)
         setenv("TWIN_GS_NO_PAGE_WRITE", "1", 0);
     }
 
+    // And direct_texture.txt tries textures read straight from render targets' pixels (hwgs.cpp's TWIN_HW_DIRECT_TEXTURE: off
+    // by default, measured no faster on a Mali-G720)
+    if (std::ifstream(Native::SettingsFolder() + "/direct_texture.txt").good())
+    {
+        setenv("TWIN_HW_DIRECT_TEXTURE", "1", 0);
+    }
+
 #if defined(TWIN_VULKAN)
     // What the phone's Vulkan offers, to the log, before the game starts as usual (native/VULKAN.md; the vulkan branch: the
     // report is what the renderer's design is decided on). vulkan_probe_off.txt in the settings folder skips it

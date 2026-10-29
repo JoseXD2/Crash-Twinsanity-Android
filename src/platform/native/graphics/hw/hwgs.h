@@ -74,6 +74,8 @@ struct HardwareStats
     // Pages a clear overwrote whole, not loaded first
     u64 clearsSkipped;
     u64 decodes;
+    // Decodes that read a target's pixels directly (no conversion of the target into memory's copy)
+    u64 directDecodes;
     u64 contentHits;
     const char* lastFallback;
     // The render thread's time (nanoseconds) in the batches' flushes (the draws), the textures' decodes, memory's passes

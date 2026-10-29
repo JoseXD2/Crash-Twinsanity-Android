@@ -1064,13 +1064,14 @@ void ThreadedFrameStats(const Shown* shown)
     const u64 gameNow = g_GameWorkNanoseconds.load();
     std::fprintf(stderr,
                  "frame: %.1f ms, vu1 %llu (%.1f ms, %.0f%% translated), vu0 %llu, primitives %llu, box pixels %llu, render %.1f ms, "
-                 "waited %.1f ms; gpu batches %llu, decodes %llu, uploads %llu, downloads %llu, readbacks %llu, copies %llu, clears %llu, fallbacks %llu; "
+                 "waited %.1f ms; gpu batches %llu, decodes %llu (%llu direct), uploads %llu, downloads %llu, readbacks %llu, copies %llu, clears %llu, fallbacks %llu; "
                  "gpu time: draw %.1f, flush %.1f, decode %.1f, memory %.1f ms; game %.1f ms\n",
                  std::chrono::duration<double, std::milli>(now - last).count(), (unsigned long long)executed, (ns - vu1Ns) / 1e6,
                  executed != 0 ? 100.0 * (translatedNow - translated) / executed : 0.0, (unsigned long long)(h.vu0->executed - vu0),
                  (unsigned long long)(shown->primitives - prims), (unsigned long long)(shown->boxPixels - pixels),
                  (busyNow - busy) / 1e6, (waitedNow - waited) / 1e6, (unsigned long long)(hwNow.batches - hw.batches),
-                 (unsigned long long)(hwNow.decodes - hw.decodes), (unsigned long long)(hwNow.uploads - hw.uploads),
+                 (unsigned long long)(hwNow.decodes - hw.decodes), (unsigned long long)(hwNow.directDecodes - hw.directDecodes),
+                 (unsigned long long)(hwNow.uploads - hw.uploads),
                  (unsigned long long)(hwNow.downloads - hw.downloads), (unsigned long long)(hwNow.readbacks - hw.readbacks),
                  (unsigned long long)(hwNow.copies - hw.copies), (unsigned long long)(hwNow.clearsSkipped - hw.clearsSkipped),
                  (unsigned long long)(hwNow.fallbacks - hw.fallbacks), (hwNow.drawNs - hw.drawNs) / 1e6, (hwNow.flushNs - hw.flushNs) / 1e6,
