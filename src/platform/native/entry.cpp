@@ -14,6 +14,7 @@
 #include <android/log.h>
 #include <unistd.h>
 
+#include <fstream>
 #include <string>
 #include <thread>
 #endif
@@ -226,6 +227,21 @@ int main(int argc, char** argv)
     }
 
     Native::StartPortable(headless);
+#if defined(__ANDROID__)
+    // A file gif_predecode_off.txt in the settings folder (Android/data/org.twinsanity.native/files) keeps the GIF's packets'
+    // decoding on the render thread (renderthread.cpp's TWIN_GIF_PREDECODE), to compare while the port's speed on phones is
+    // found out
+    if (std::ifstream(Native::SettingsFolder() + "/gif_predecode_off.txt").good())
+    {
+        setenv("TWIN_GIF_PREDECODE", "0", 0);
+    }
+
+    // And page_write_off.txt keeps WriteImage's whole-page copies off (gs.cpp's TWIN_GS_NO_PAGE_WRITE)
+    if (std::ifstream(Native::SettingsFolder() + "/page_write_off.txt").good())
+    {
+        setenv("TWIN_GS_NO_PAGE_WRITE", "1", 0);
+    }
+#endif
 #if defined(_WIN32)
     SetUpLog();
     Native::StartProfiler();

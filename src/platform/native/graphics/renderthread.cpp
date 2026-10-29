@@ -4,10 +4,12 @@
 #include "hardware.h"
 #include "ee/gif.h"
 #include "ee/vif.h"
+#include "gs/gs.h"
 
 #include <SDL3/SDL.h>
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -37,6 +39,25 @@ enum RecordKind : u32
     RecordKick,
     RecordCall,
     RecordVif1,
+    // The GIF's packets decoded by the VU stage (GifPredecoder): GS register writes, and IMAGE data for WriteImage
+    RecordGsWrites,
+    RecordGsImage,
+};
+
+// A GS write the VU stage decoded from a packet: a register's address and value, or one of the marks below
+struct GsWrite
+{
+    u32 op;
+    u32 unused;
+    u64 value;
+};
+static_assert(sizeof(GsWrite) == 16);
+enum GsWriteOp : u32
+{
+    // (below: a register's address, WriteRegister's)
+    OpStartTag = 0x100,
+    OpTraceBegin = 0x101,
+    OpTraceEnd = 0x102,
 };
 
 struct Header
@@ -75,6 +96,56 @@ struct Chunk
 constexpr size_t ChunkBytes = 512 * 1024;
 // Chunks kept for reuse no bigger than this (a huge transfer's goes)
 constexpr size_t KeptChunkBytes = 8 * 1024 * 1024;
+
+// $TWIN_GIF_PREDECODE (on unless 0): with three stages, the VU stage decodes the GIF's packets (the tags, PACKED's forms of
+// the registers, REGLIST) into plain register writes and IMAGE runs, and the render thread writes them to the GS as they are
+// (Gs::WriteRegister, Gs::WriteImage) in place of Gif::TransferNow's parsing: the per-vertex decoding leaves the render thread,
+// the busiest, for the VU stage, which waits half its time
+bool PredecodeWanted()
+{
+    static const bool wanted = []
+    {
+        const char* setting = std::getenv("TWIN_GIF_PREDECODE");
+        return setting == nullptr || setting[0] != '0';
+    }();
+    return wanted;
+}
+
+class RenderThread;
+
+// Ee::Gif's parsing (ee/gif.cpp) with the GS's PACKED decoding (Gs::WritePacked) folded in, writing GsWrite records to a queue
+// instead of the GS. The paths' places in their packets are kept here as the GIF keeps them; the Q PACKED's ST leaves for the
+// next RGBAQ (Gs::packedQ_) is kept here too, so an RGBAQ arrives whole
+class GifPredecoder
+{
+public:
+    void Transfer(RenderThread& to, u32 path, const u8* data, u32 quadwords);
+    // A kick's quadwords in a row (Gif::KickRow): path 1 starts a packet fresh, and stops at the packet with EOP
+    void Kick(RenderThread& to, const u8* row, u32 quadwords, u32 source);
+
+private:
+    struct Path
+    {
+        u32 loops = 0;
+        u32 registerCount = 0;
+        u64 registers = 0;
+        u32 format = 0;
+        bool endOfPacket = false;
+        u32 reg = 0;
+    };
+
+    u32 Parse(RenderThread& to, u32 index, const u8* data, u32 quadwords, bool stopAtEnd);
+    void Packed(u32 descriptor, const u32* q);
+    void Write(u32 op, u64 value)
+    {
+        writes_.push_back({op, 0, value});
+    }
+    void FlushWrites(RenderThread& to);
+
+    Path paths_[3];
+    f32 packedQ_ = 1.0f;
+    std::vector<GsWrite> writes_;
+};
 
 class RenderThread final : public Ee::Gif::Forward
 {
@@ -123,6 +194,9 @@ private:
     Chunk* filling_ = nullptr;
     // The VU stage's: the render thread's queue it hands on to
     RenderThread* next_ = nullptr;
+    // The render thread's queue's: the VU stage's decoding of the packets it's handed (used on the VU stage's thread only)
+    GifPredecoder predecoder_;
+    friend class GifPredecoder;
 };
 
 RenderThread g_RenderThread;
@@ -218,6 +292,13 @@ void RenderThread::Transfer(u32 path, const u8* data, u32 quadwords)
         return;
     }
 
+    // (the VU stage's thread, to the render thread's queue: decoded first)
+    if (t_OnVuThread && PredecodeWanted())
+    {
+        predecoder_.Transfer(*this, path, data, quadwords);
+        return;
+    }
+
     std::memcpy(Record(RecordTransfer, path, quadwords), data, static_cast<size_t>(quadwords) * 16);
 }
 
@@ -237,9 +318,20 @@ void RenderThread::Kick(const u8* vuMemory, u32 address, u32 quadwords, u32 sour
 
     // The ring's quadwords from the address, wrapping at its end
     constexpr u32 Ring = 0x400;
-    u8* to = Record(RecordKick, source, quadwords);
     u32 at = address & (Ring - 1);
     u32 first = std::min(quadwords, Ring - at);
+    if (t_OnVuThread && PredecodeWanted())
+    {
+        // (the VU stage's thread: the row laid out, then decoded)
+        static thread_local std::vector<u8> row;
+        row.resize(static_cast<size_t>(quadwords) * 16);
+        std::memcpy(row.data(), vuMemory + at * 16, static_cast<size_t>(first) * 16);
+        std::memcpy(row.data() + first * 16, vuMemory, static_cast<size_t>(quadwords - first) * 16);
+        predecoder_.Kick(*this, row.data(), quadwords, source);
+        return;
+    }
+
+    u8* to = Record(RecordKick, source, quadwords);
     std::memcpy(to, vuMemory + at * 16, static_cast<size_t>(first) * 16);
     std::memcpy(to + first * 16, vuMemory, static_cast<size_t>(quadwords - first) * 16);
 }
@@ -247,7 +339,200 @@ void RenderThread::Kick(const u8* vuMemory, u32 address, u32 quadwords, u32 sour
 // A kick already laid out in a row (the VU stage handing on one the game's thread queued)
 void RenderThread::Kicked(const u8* row, u32 quadwords, u32 source)
 {
+    if (t_OnVuThread && PredecodeWanted())
+    {
+        predecoder_.Kick(*this, row, quadwords, source);
+        return;
+    }
+
     std::memcpy(Record(RecordKick, source, quadwords), row, static_cast<size_t>(quadwords) * 16);
+}
+
+// ------------------------------------------------------------------------------------------------------ the predecoder
+void GifPredecoder::FlushWrites(RenderThread& to)
+{
+    if (writes_.empty())
+    {
+        return;
+    }
+
+    const u32 count = static_cast<u32>(writes_.size());
+    std::memcpy(to.Record(RecordGsWrites, count, count), writes_.data(), static_cast<size_t>(count) * sizeof(GsWrite));
+    writes_.clear();
+}
+
+void GifPredecoder::Transfer(RenderThread& to, u32 path, const u8* data, u32 quadwords)
+{
+    Parse(to, path, data, quadwords, false);
+    FlushWrites(to);
+}
+
+void GifPredecoder::Kick(RenderThread& to, const u8* row, u32 quadwords, u32 source)
+{
+    Write(OpTraceBegin, source);
+    paths_[0] = Path{};
+    Parse(to, 0, row, quadwords, true);
+    Write(OpTraceEnd, 0);
+    FlushWrites(to);
+}
+
+// Gs::WritePacked's decoding of a PACKED quadword into the register write it makes
+void GifPredecoder::Packed(u32 descriptor, const u32* q)
+{
+    switch (descriptor)
+    {
+    case Gs::PRIM:
+        Write(Gs::PRIM, q[0] & 0x7FF);
+        break;
+    case Gs::RGBAQ:
+    {
+        // The colour, and the Q the last ST brought
+        const u64 value = static_cast<u64>(q[0] & 0xFF) | static_cast<u64>(q[1] & 0xFF) << 8 | static_cast<u64>(q[2] & 0xFF) << 16 |
+                          static_cast<u64>(q[3] & 0xFF) << 24 | static_cast<u64>(std::bit_cast<u32>(packedQ_)) << 32;
+        Write(Gs::RGBAQ, value);
+        break;
+    }
+    case Gs::ST:
+        packedQ_ = std::bit_cast<f32>(q[2]);
+        Write(Gs::ST, static_cast<u64>(q[0]) | static_cast<u64>(q[1]) << 32);
+        break;
+    case Gs::UV:
+        Write(Gs::UV, static_cast<u64>(q[0] & 0x3FFF) | static_cast<u64>(q[1] & 0x3FFF) << 16);
+        break;
+    case Gs::XYZF2:
+    {
+        const bool noKick = (q[3] >> 15) & 1;
+        const u64 value = static_cast<u64>(q[0] & 0xFFFF) | static_cast<u64>(q[1] & 0xFFFF) << 16 |
+                          static_cast<u64>((q[2] >> 4) & 0xFFFFFF) << 32 | static_cast<u64>((q[3] >> 4) & 0xFF) << 56;
+        Write(noKick ? Gs::XYZF3 : Gs::XYZF2, value);
+        break;
+    }
+    case Gs::XYZ2:
+    {
+        const bool noKick = (q[3] >> 15) & 1;
+        const u64 value = static_cast<u64>(q[0] & 0xFFFF) | static_cast<u64>(q[1] & 0xFFFF) << 16 | static_cast<u64>(q[2]) << 32;
+        Write(noKick ? Gs::XYZ3 : Gs::XYZ2, value);
+        break;
+    }
+    case Gs::FOG:
+        Write(Gs::FOG, static_cast<u64>((q[3] >> 4) & 0xFF) << 56);
+        break;
+    case 0xE:
+        Write(q[2] & 0xFF, static_cast<u64>(q[0]) | static_cast<u64>(q[1]) << 32);
+        break;
+    case 0xF:
+        break;
+    default:
+        // The other registers take the quadword's low doubleword
+        Write(descriptor, static_cast<u64>(q[0]) | static_cast<u64>(q[1]) << 32);
+        break;
+    }
+}
+
+// Gif::TransferNow's walk through the packets, writing the records instead of the GS
+u32 GifPredecoder::Parse(RenderThread& to, u32 index, const u8* data, u32 quadwords, bool stopAtEnd)
+{
+    constexpr u32 FormatPacked = 0;
+    constexpr u32 FormatRegList = 1;
+    Path& path = paths_[index];
+    u32 taken = 0;
+    while (taken < quadwords)
+    {
+        const u8* at = data + taken * 16;
+        if (path.loops == 0)
+        {
+            u64 low;
+            u64 high;
+            std::memcpy(&low, at, 8);
+            std::memcpy(&high, at + 8, 8);
+            taken++;
+            path.loops = low & 0x7FFF;
+            path.endOfPacket = (low >> 15) & 1;
+            const bool pre = (low >> 46) & 1;
+            const u32 prim = (low >> 47) & 0x7FF;
+            path.format = (low >> 58) & 3;
+            path.registerCount = (low >> 60) & 0xF;
+            if (path.registerCount == 0)
+            {
+                path.registerCount = 16;
+            }
+
+            path.registers = high;
+            path.reg = 0;
+            if (path.loops > 0)
+            {
+                packedQ_ = 1.0f;
+                Write(OpStartTag, 0);
+                if (pre && path.format == FormatPacked)
+                {
+                    Write(Gs::PRIM, prim);
+                }
+            }
+            else if (path.endOfPacket && stopAtEnd)
+            {
+                return taken;
+            }
+
+            continue;
+        }
+
+        switch (path.format)
+        {
+        case FormatPacked:
+        {
+            u32 q[4];
+            std::memcpy(q, at, 16);
+            Packed((path.registers >> (path.reg * 4)) & 0xF, q);
+            taken++;
+            if (++path.reg == path.registerCount)
+            {
+                path.reg = 0;
+                path.loops--;
+            }
+
+            break;
+        }
+        case FormatRegList:
+        {
+            for (u32 half = 0; half < 2 && path.loops > 0; half++)
+            {
+                u64 value;
+                std::memcpy(&value, at + half * 8, 8);
+                const u32 descriptor = (path.registers >> (path.reg * 4)) & 0xF;
+                if (descriptor < 0xE)
+                {
+                    Write(descriptor, value);
+                }
+
+                if (++path.reg == path.registerCount)
+                {
+                    path.reg = 0;
+                    path.loops--;
+                }
+            }
+
+            taken++;
+            break;
+        }
+        default:
+        {
+            // IMAGE: the run's quadwords as they are, after the writes before them
+            const u32 count = quadwords - taken < path.loops ? quadwords - taken : path.loops;
+            FlushWrites(to);
+            std::memcpy(to.Record(RecordGsImage, count * 16, count), at, static_cast<size_t>(count) * 16);
+            taken += count;
+            path.loops -= count;
+            break;
+        }
+        }
+
+        if (path.loops == 0 && path.endOfPacket && stopAtEnd)
+        {
+            return taken;
+        }
+    }
+
+    return taken;
 }
 
 void RenderThread::Call(std::function<void()> work)
@@ -375,6 +660,35 @@ void RenderThread::Play(Chunk& chunk)
         case RecordVif1:
             GetHardware().vif1->Process(reinterpret_cast<const u32*>(at), header.value);
             break;
+        case RecordGsWrites:
+        {
+            // The VU stage's decoding of the packets: the register writes as the GIF would make them
+            Gs::Gs& gs = gif.gs();
+            const GsWrite* write = reinterpret_cast<const GsWrite*>(at);
+            for (u32 i = 0; i < header.value; i++, write++)
+            {
+                switch (write->op)
+                {
+                case OpStartTag:
+                    gs.StartTag();
+                    break;
+                case OpTraceBegin:
+                    gs.traceSource = static_cast<u32>(write->value);
+                    break;
+                case OpTraceEnd:
+                    gs.traceSource = ~0u;
+                    break;
+                default:
+                    gs.WriteRegister(write->op, write->value);
+                    break;
+                }
+            }
+
+            break;
+        }
+        case RecordGsImage:
+            gif.gs().WriteImage(at, header.value);
+            break;
         default:
             break;
         }
@@ -466,6 +780,8 @@ void RenderThread::StartStage(RenderThread* next)
     stopping_ = false;
     thread_ = std::thread([this] { Run(); });
     GetHardware().gif->SetForward(this);
+    Native::Log("threads: the VU stage %s the GIF's packets for the render thread (TWIN_GIF_PREDECODE)",
+                PredecodeWanted() ? "decodes" : "hands on");
 }
 
 void RenderThread::Stop()

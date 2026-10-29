@@ -4,12 +4,16 @@
 #include "backend.h"
 #include "workers.h"
 
+#include <cstdio>
+#include <string>
+#include <map>
 #include <atomic>
 #include <functional>
 
 #include "../state.h"
 
 #include <algorithm>
+#include <vector>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -342,6 +346,27 @@ void Gs::WriteRegister(u32 address, u64 value)
         {
         case 0:
             // Host to local: the IMAGE data that follows fills the rectangle
+            {
+                // (TWIN_HW_STATS: the transfers by destination and size, every 2000)
+                static const bool counting = std::getenv("TWIN_HW_STATS") != nullptr;
+                if (counting)
+                {
+                    static std::map<std::string, u64> counts;
+                    static u64 total = 0;
+                    char detail[96];
+                    std::snprintf(detail, sizeof(detail), "transfer to %x/%u psm %u: %ux%u at %u,%u", bitbltbuf_.dbp, bitbltbuf_.dbw,
+                                  bitbltbuf_.dpsm, trxreg_.rrw, trxreg_.rrh, trxpos_.dsax, trxpos_.dsay);
+                    counts[detail]++;
+                    if (++total % 2000 == 0)
+                    {
+                        for (auto& entry : counts)
+                        {
+                            std::fprintf(stderr, "transfers: %llu %s\n", static_cast<unsigned long long>(entry.second), entry.first.c_str());
+                        }
+                    }
+                }
+            }
+
             PrepareCpuRect(true, bitbltbuf_.dpsm, bitbltbuf_.dbp, bitbltbuf_.dbw, static_cast<s32>(trxpos_.dsax),
                            static_cast<s32>(trxpos_.dsay), static_cast<s32>(trxpos_.dsax + trxreg_.rrw) - 1,
                            static_cast<s32>(trxpos_.dsay + trxreg_.rrh) - 1, "host to local transfer");
@@ -759,6 +784,53 @@ void Gs::WriteImage(const u8* data, u32 bytes)
         u32* vm32 = reinterpret_cast<u32*>(vm_);
         if (psm == PSMCT32)
         {
+            // Whole pages of a 64 wide PSMCT32 rectangle starting at a page's corner (the game's uploads of its effects' buffers
+            // are 64x32, 64x64, 64x96 and 64x160 at 0,0: a page each 32 rows), as the data for one arrives whole: the 2048
+            // words go to their places in the page by a table made once, the page marked once. Each is the address
+            // PixelAddress32 gives, less its per-pixel work
+            // ($TWIN_GS_NO_PAGE_WRITE=1 keeps every pixel on the loop below, to compare)
+            static const bool pageWriteOff = std::getenv("TWIN_GS_NO_PAGE_WRITE") != nullptr && std::getenv("TWIN_GS_NO_PAGE_WRITE")[0] != '0';
+            if (!pageWriteOff && width == 64 && (left & 63) == 0 && ((top + transferY_) & 31) == 0 && transferX_ == 0)
+            {
+                static const std::vector<u32> pageOrder = []
+                {
+                    std::vector<u32> order(64 * 32);
+                    for (u32 y = 0; y < 32; y++)
+                    {
+                        for (u32 x = 0; x < 64; x++)
+                        {
+                            order[y * 64 + x] = Block32(x >> 3, y >> 3) << 6 | Column32(x & 7, y & 7);
+                        }
+                    }
+
+                    return order;
+                }();
+                while (offset + 64 * 32 * 4 <= size && transferY_ + 32 <= height)
+                {
+                    const u32 y = (top + transferY_) & 2047;
+                    const u32 page = (y >> 5) * bw + ((left & 2047) >> 6);
+                    const u32 blockBase = bp + page * 32;
+                    // (the page's 32 blocks wrapping round memory's end: the pixel loop below takes it)
+                    if (((blockBase + 31) & BlockMask) < (blockBase & BlockMask))
+                    {
+                        break;
+                    }
+
+                    u32* pageWords = &vm32[(blockBase & BlockMask) << 6];
+                    const u32* source = reinterpret_cast<const u32*>(at + offset);
+                    u32 words[64 * 32];
+                    std::memcpy(words, source, sizeof(words));
+                    for (u32 i = 0; i < 64 * 32; i++)
+                    {
+                        pageWords[pageOrder[i]] = words[i];
+                    }
+
+                    mark((blockBase & BlockMask) >> 5);
+                    offset += 64 * 32 * 4;
+                    transferY_ += 32;
+                }
+            }
+
             for (; offset + 4 <= size && transferY_ < height; offset += 4)
             {
                 u32 a = PixelAddress32((left + transferX_) & 2047, (top + transferY_) & 2047, bp, bw);
