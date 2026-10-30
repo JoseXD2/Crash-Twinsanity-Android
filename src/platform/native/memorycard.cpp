@@ -120,8 +120,22 @@ fs::path HostPath(const char* name)
     return result;
 }
 
+// What the card's files take, counted once and again only after a change: the game asks for the card's info every frame, and
+// walking the folder each time cost a quarter of the game thread's work on Android (its shared storage is slow to list)
+s32 g_UsedClusters = -1;
+
+void CardChanged()
+{
+    g_UsedClusters = -1;
+}
+
 s32 UsedClusters()
 {
+    if (g_UsedClusters >= 0)
+    {
+        return g_UsedClusters;
+    }
+
     std::error_code error;
     s32 clusters = 0;
     for (auto it = fs::recursive_directory_iterator(Root(), error); !error && it != fs::recursive_directory_iterator();
@@ -131,6 +145,7 @@ s32 UsedClusters()
         clusters += it->is_directory() ? 2 : static_cast<s32>((it->file_size() + 1023) / 1024);
     }
 
+    g_UsedClusters = clusters;
     return clusters;
 }
 
@@ -214,6 +229,7 @@ s32 Platform::MemoryCard::GetInfo(s32 port, s32 slot, s32* type, s32* freeCluste
 
 s32 Platform::MemoryCard::Open(s32 port, s32 slot, const char* name, s32 flags)
 {
+    CardChanged();
     if (!CardThere(port, slot))
     {
         return Finish(FunctionOpen, ResultNoEntry);
@@ -266,6 +282,7 @@ s32 Platform::MemoryCard::Open(s32 port, s32 slot, const char* name, s32 flags)
 
 s32 Platform::MemoryCard::Close(s32 file)
 {
+    CardChanged();
     auto found = g_Files.find(file);
     if (found == g_Files.end())
     {
@@ -293,6 +310,7 @@ s32 Platform::MemoryCard::Read(s32 file, void* buffer, s32 size)
 
 s32 Platform::MemoryCard::Write(s32 file, const void* buffer, s32 size)
 {
+    CardChanged();
     auto found = g_Files.find(file);
     if (found == g_Files.end())
     {
@@ -312,6 +330,7 @@ s32 Platform::MemoryCard::Write(s32 file, const void* buffer, s32 size)
 
 s32 Platform::MemoryCard::MakeDirectory(s32 port, s32 slot, const char* name)
 {
+    CardChanged();
     if (!CardThere(port, slot))
     {
         return Finish(FunctionMakeDirectory, ResultNoEntry);
@@ -394,6 +413,7 @@ s32 Platform::MemoryCard::GetDirectory(s32 port, s32 slot, const char* name, u32
 
 s32 Platform::MemoryCard::Delete(s32 port, s32 slot, const char* name)
 {
+    CardChanged();
     if (!CardThere(port, slot))
     {
         return Finish(FunctionDelete, ResultNoEntry);
@@ -418,6 +438,7 @@ s32 Platform::MemoryCard::Delete(s32 port, s32 slot, const char* name)
 // one the PS2 found unformatted, which this one never is)
 s32 Platform::MemoryCard::Format(s32 port, s32 slot)
 {
+    CardChanged();
     return Finish(FunctionFormat, CardThere(port, slot) ? ResultSucceeded : ResultNoEntry);
 }
 
