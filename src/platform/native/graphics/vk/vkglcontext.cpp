@@ -268,7 +268,15 @@ void EndRendering(Context& c)
 {
     if (c.rendering.active)
     {
-        vkCmdEndRendering(c.commands);
+        if (GetDevice().renderPasses)
+        {
+            vkCmdEndRenderPass(c.commands);
+        }
+        else
+        {
+            vkCmdEndRendering(c.commands);
+        }
+
         c.rendering.active = false;
     }
 }

@@ -161,6 +161,8 @@ void CaptureShown()
 
     if (c.path.empty())
     {
+        // (counted with no recording too: the trigger waits for the shown count)
+        c.shown++;
         return;
     }
 

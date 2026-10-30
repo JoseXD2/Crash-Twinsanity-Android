@@ -23,8 +23,12 @@ f32 TouchControlsTopInset();
 // Watches the touch events (once, from the pad's read)
 void StartTouchControls();
 // The touch controls' buttons and sticks added to the pad's read; the controls are read only while the game's window shows the
-// game (not the native options)
+// game (the native options take them through TouchMenuPad)
 void ReadTouchControls(BoundPad* pad);
+// The options navigated with the touch controls (settings.cpp, while they're open): whether they are (the controls on), and the
+// buttons held (PadBit*) and the stick's push (-1 to 1 each way); the touches don't point at the options' items then
+bool TouchPadDrivesOptions();
+void TouchMenuPad(u32* buttons, f32* stickX, f32* stickY);
 // The controls drawn (overlayrender.cpp, after the frame's commands)
 void AddTouchControls(std::vector<OverlayFrame::Command>* commands, int pixelWidth, int pixelHeight);
 

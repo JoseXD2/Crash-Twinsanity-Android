@@ -39,6 +39,10 @@ framebuffer change and every copy.
   timestamp queries), `vkglprogram.cpp` (GLSL 330 core made 450 and compiled by glslang with the relaxed Vulkan rules: the loose
   uniforms in one block, read back by reflection), `vkgldraw.cpp` (dynamic rendering, pipelines by state with the depth, stencil,
   viewport and scissor dynamic, clears, uploads, reads, blits as draws), `vkglentry.cpp` (the GL entry points).
+- Vulkan 1.1 is enough: a driver without 1.3's dynamic rendering (the Poco F5's Adreno 725 reports 1.1) gets render pass objects
+  and framebuffers (cached by formats and views), the depth, stencil and topology state baked into the pipelines in place of
+  the dynamic state; `$TWIN_VULKAN_RENDER_PASSES=1` takes that path anywhere and `$TWIN_VULKAN_API=1.1` acts as a 1.1 driver
+  (both pixel-identical in `vktest`, the validation layer silent).
 - Chosen by the Display page's "renderer" (options.txt's `renderer=1`) or `$TWIN_RENDERER=vulkan`, at the start: the window is
   made with `SDL_WINDOW_VULKAN`; when Vulkan doesn't start the window is made again for OpenGL (the log says which it is).
 - Checked: `vktest` (a GL program run on Mesa's GL and on VkGl over lavapipe: textures, blending, depth, stencil, dual-source, an

@@ -101,6 +101,195 @@ bool SameAttachments(const Rendering& r, const Attachments& a)
     return r.depthImage == (a.depth != nullptr ? a.depth->image : VK_NULL_HANDLE) && r.width == a.width && r.height == a.height;
 }
 
+// ------------------------------------------------------------------------------------------- render pass objects (Vulkan 1.1)
+// Without dynamic rendering: a render pass by the attachments' formats and their load operations (the pipelines made with the
+// one that loads everything: render passes differing only in those are compatible), a framebuffer by the pass and the views
+std::mutex g_PassesLock;
+std::unordered_map<std::string, VkRenderPass> g_RenderPasses;
+std::unordered_map<std::string, VkFramebuffer> g_Framebuffers;
+std::unordered_map<VkImageView, std::vector<std::string>> g_FramebuffersOfView;
+
+VkRenderPass RenderPassFor(const Attachments& a, bool clearColour, bool clearDepth, bool clearStencil)
+{
+    std::string key;
+    auto add = [&key](u32 value) { key.append(reinterpret_cast<const char*>(&value), sizeof(value)); };
+    add(a.colourCount);
+    for (u32 i = 0; i < a.colourCount; i++)
+    {
+        add(a.colour[i] != nullptr ? static_cast<u32>(a.colour[i]->format) : 0u);
+    }
+
+    add(a.depth != nullptr ? static_cast<u32>(a.depth->format) : 0u);
+    add((clearColour ? 1u : 0u) | (clearDepth ? 2u : 0u) | (clearStencil ? 4u : 0u));
+    std::lock_guard lock(g_PassesLock);
+    auto found = g_RenderPasses.find(key);
+    if (found != g_RenderPasses.end())
+    {
+        return found->second;
+    }
+
+    std::vector<VkAttachmentDescription> descriptions;
+    VkAttachmentReference colours[4] = {};
+    for (u32 i = 0; i < a.colourCount; i++)
+    {
+        if (a.colour[i] == nullptr)
+        {
+            colours[i] = {VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED};
+            continue;
+        }
+
+        VkAttachmentDescription d = {};
+        d.format = a.colour[i]->format;
+        d.samples = VK_SAMPLE_COUNT_1_BIT;
+        d.loadOp = clearColour ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        d.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        d.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        d.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        d.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+        d.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+        colours[i] = {static_cast<u32>(descriptions.size()), VK_IMAGE_LAYOUT_GENERAL};
+        descriptions.push_back(d);
+    }
+
+    VkAttachmentReference depth = {VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (a.depth != nullptr)
+    {
+        const bool stencil = (a.depth->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+        VkAttachmentDescription d = {};
+        d.format = a.depth->format;
+        d.samples = VK_SAMPLE_COUNT_1_BIT;
+        d.loadOp = clearDepth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        d.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        d.stencilLoadOp = !stencil ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : clearStencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        d.stencilStoreOp = stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        d.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+        d.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+        depth = {static_cast<u32>(descriptions.size()), VK_IMAGE_LAYOUT_GENERAL};
+        descriptions.push_back(d);
+    }
+
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = a.colourCount;
+    subpass.pColorAttachments = colours;
+    subpass.pDepthStencilAttachment = a.depth != nullptr ? &depth : nullptr;
+    // (every write before and after made visible: the barriers around a rendering instance, as with dynamic rendering)
+    VkSubpassDependency dependencies[2] = {};
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+    dependencies[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    dependencies[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    dependencies[1].srcSubpass = 0;
+    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    dependencies[1].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    VkRenderPassCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    info.attachmentCount = static_cast<u32>(descriptions.size());
+    info.pAttachments = descriptions.data();
+    info.subpassCount = 1;
+    info.pSubpasses = &subpass;
+    info.dependencyCount = 2;
+    info.pDependencies = dependencies;
+    VkRenderPass pass = VK_NULL_HANDLE;
+    if (vkCreateRenderPass(GetDevice().device, &info, nullptr, &pass) != VK_SUCCESS)
+    {
+        Log("vkCreateRenderPass failed");
+    }
+
+    g_RenderPasses[key] = pass;
+    return pass;
+}
+
+VkFramebuffer FramebufferFor(VkRenderPass compatible, const Attachments& a, const std::vector<VkImageView>& views)
+{
+    std::string key(reinterpret_cast<const char*>(&compatible), sizeof(compatible));
+    for (VkImageView view : views)
+    {
+        key.append(reinterpret_cast<const char*>(&view), sizeof(view));
+    }
+
+    key.append(reinterpret_cast<const char*>(&a.width), sizeof(a.width));
+    key.append(reinterpret_cast<const char*>(&a.height), sizeof(a.height));
+    std::lock_guard lock(g_PassesLock);
+    auto found = g_Framebuffers.find(key);
+    if (found != g_Framebuffers.end())
+    {
+        return found->second;
+    }
+
+    VkFramebufferCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    info.renderPass = compatible;
+    info.attachmentCount = static_cast<u32>(views.size());
+    info.pAttachments = views.data();
+    info.width = a.width;
+    info.height = a.height;
+    info.layers = 1;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    if (vkCreateFramebuffer(GetDevice().device, &info, nullptr, &framebuffer) != VK_SUCCESS)
+    {
+        Log("vkCreateFramebuffer failed");
+        return VK_NULL_HANDLE;
+    }
+
+    g_Framebuffers[key] = framebuffer;
+    for (VkImageView view : views)
+    {
+        g_FramebuffersOfView[view].push_back(key);
+    }
+
+    return framebuffer;
+}
+
+// A render pass instance into the attachments (the render pass objects' BeginRendering)
+void BeginRenderPass(Context& c, const Attachments& a, const VkClearValue* colourClear, const VkClearValue* depthClear, bool clearStencil)
+{
+    const bool hasStencil = a.depth != nullptr && (a.depth->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+    const bool clearsStencil = hasStencil && clearStencil;
+    VkRenderPass compatible = RenderPassFor(a, false, false, false);
+    VkRenderPass pass = RenderPassFor(a, colourClear != nullptr, depthClear != nullptr, clearsStencil);
+    std::vector<VkImageView> views;
+    std::vector<VkClearValue> clears;
+    for (u32 i = 0; i < a.colourCount; i++)
+    {
+        if (a.colour[i] != nullptr)
+        {
+            views.push_back(ViewOf(*a.colour[i], a.colourLevel[i], 1, VK_IMAGE_ASPECT_COLOR_BIT));
+            clears.push_back(colourClear != nullptr ? *colourClear : VkClearValue{});
+        }
+    }
+
+    if (a.depth != nullptr)
+    {
+        views.push_back(ViewOf(*a.depth, a.depthLevel, 1, a.depth->aspects));
+        VkClearValue value = {};
+        value.depthStencil = {depthClear != nullptr ? depthClear->depthStencil.depth : 1.0f,
+                              depthClear != nullptr ? depthClear->depthStencil.stencil : static_cast<u32>(c.clearStencil) & 0xFF};
+        clears.push_back(value);
+    }
+
+    VkFramebuffer framebuffer = FramebufferFor(compatible, a, views);
+    if (pass == VK_NULL_HANDLE || compatible == VK_NULL_HANDLE || framebuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkRenderPassBeginInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    info.renderPass = pass;
+    info.framebuffer = framebuffer;
+    info.renderArea = {{0, 0}, {a.width, a.height}};
+    info.clearValueCount = static_cast<u32>(clears.size());
+    info.pClearValues = clears.data();
+    vkCmdBeginRenderPass(Commands(c), &info, VK_SUBPASS_CONTENTS_INLINE);
+    c.rendering.renderPass = compatible;
+}
+
 // A rendering instance into the attachments, its first touch a clear of each when clears are given (else their contents kept)
 void BeginRendering(Context& c, const Attachments& a, const VkClearValue* colourClear, const VkClearValue* depthClear,
                     bool clearStencil)
@@ -160,17 +349,25 @@ void BeginRendering(Context& c, const Attachments& a, const VkClearValue* colour
         }
     }
 
-    VkRenderingInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    info.renderArea = {{0, 0}, {a.width, a.height}};
-    info.layerCount = 1;
-    info.colorAttachmentCount = a.colourCount;
-    info.pColorAttachments = colours;
-    info.pDepthAttachment = a.depth != nullptr ? &depth : nullptr;
-    info.pStencilAttachment = hasStencil ? &stencil : nullptr;
-    vkCmdBeginRendering(Commands(c), &info);
     Rendering& r = c.rendering;
     r = Rendering{};
+    if (GetDevice().renderPasses)
+    {
+        BeginRenderPass(c, a, colourClear, depthClear, clearStencil);
+    }
+    else
+    {
+        VkRenderingInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        info.renderArea = {{0, 0}, {a.width, a.height}};
+        info.layerCount = 1;
+        info.colorAttachmentCount = a.colourCount;
+        info.pColorAttachments = colours;
+        info.pDepthAttachment = a.depth != nullptr ? &depth : nullptr;
+        info.pStencilAttachment = hasStencil ? &stencil : nullptr;
+        vkCmdBeginRendering(Commands(c), &info);
+    }
+
     r.active = true;
     for (u32 i = 0; i < 4; i++)
     {
@@ -217,6 +414,28 @@ struct PipelineKey
     u32 blendOps[2];
     u32 writeMask;
     u32 integerColour;
+    // Render pass objects: the pass, and the state dynamic rendering's path sets dynamically (else zero)
+    VkRenderPass renderPass;
+    u32 topology;
+    u32 depthTest;
+    u32 depthWrite;
+    u32 depthCompare;
+    u32 stencilTest;
+    u32 stencilOps[4];
+};
+
+// The depth, stencil and topology state of a draw: dynamic (SetFixed) or in the pipeline (FixInKey, render pass objects)
+struct Fixed
+{
+    VkPrimitiveTopology topology;
+    bool depthTest;
+    bool depthWrite;
+    VkCompareOp depthCompare;
+    bool stencilTest;
+    VkStencilOp fail;
+    VkStencilOp pass;
+    VkStencilOp depthFail;
+    VkCompareOp stencilCompare;
 };
 
 struct KeyHash
@@ -505,6 +724,23 @@ VkPipeline PipelineFor(const PipelineKey& key)
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo depthStencil = {};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    const bool baked = key.renderPass != VK_NULL_HANDLE;
+    if (baked)
+    {
+        assembly.topology = static_cast<VkPrimitiveTopology>(key.topology);
+        depthStencil.depthTestEnable = key.depthTest;
+        depthStencil.depthWriteEnable = key.depthWrite;
+        depthStencil.depthCompareOp = static_cast<VkCompareOp>(key.depthCompare);
+        depthStencil.stencilTestEnable = key.stencilTest;
+        VkStencilOpState op = {};
+        op.failOp = static_cast<VkStencilOp>(key.stencilOps[0]);
+        op.passOp = static_cast<VkStencilOp>(key.stencilOps[1]);
+        op.depthFailOp = static_cast<VkStencilOp>(key.stencilOps[2]);
+        op.compareOp = static_cast<VkCompareOp>(key.stencilOps[3]);
+        depthStencil.front = op;
+        depthStencil.back = op;
+    }
+
     VkPipelineColorBlendAttachmentState blends[4] = {};
     for (u32 i = 0; i < key.colourCount; i++)
     {
@@ -531,6 +767,12 @@ VkPipeline PipelineFor(const PipelineKey& key)
         VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,      VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
         VK_DYNAMIC_STATE_CULL_MODE,          VK_DYNAMIC_STATE_FRONT_FACE,
     };
+    if (baked)
+    {
+        // (Vulkan 1.0's dynamic state only)
+        dynamics.resize(6);
+    }
+
     VkPipelineDynamicStateCreateInfo dynamic = {};
     dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
     dynamic.dynamicStateCount = static_cast<u32>(dynamics.size());
@@ -543,7 +785,8 @@ VkPipeline PipelineFor(const PipelineKey& key)
     rendering.stencilAttachmentFormat = key.stencilFormat;
     VkGraphicsPipelineCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    info.pNext = &rendering;
+    info.pNext = baked ? nullptr : &rendering;
+    info.renderPass = key.renderPass;
     info.stageCount = 2;
     info.pStages = stages;
     info.pVertexInputState = &vertexInput;
@@ -699,16 +942,56 @@ void SetDynamicState(Context& c, const Attachments& a, GLenum mode, bool hasDept
     VkRect2D scissor = {{x0, y0}, {static_cast<u32>(std::max(0, x1 - x0)), static_cast<u32>(std::max(0, y1 - y0))}};
     vkCmdSetScissor(commands, 0, 1, &scissor);
     vkCmdSetBlendConstants(commands, c.blendColour);
-    vkCmdSetDepthTestEnable(commands, c.depthTest && hasDepth ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthWriteEnable(commands, c.depthTest && hasDepth && c.depthMask ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthCompareOp(commands, Compare(c.depthFunc));
-    vkCmdSetStencilTestEnable(commands, c.stencilTest && hasStencil ? VK_TRUE : VK_FALSE);
-    vkCmdSetStencilOp(commands, VK_STENCIL_FACE_FRONT_AND_BACK, StencilOp(c.stencilFail), StencilOp(c.stencilPass),
-                      StencilOp(c.stencilDepthFail), Compare(c.stencilFunc));
     vkCmdSetStencilCompareMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, c.stencilValueMask & 0xFF);
     vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, c.stencilWriteMask & 0xFF);
     vkCmdSetStencilReference(commands, VK_STENCIL_FACE_FRONT_AND_BACK, static_cast<u32>(c.stencilRef) & 0xFF);
-    vkCmdSetPrimitiveTopology(commands, Topology(mode));
+    (void)mode;
+    (void)hasDepth;
+    (void)hasStencil;
+}
+
+Fixed FixedOf(const Context& c, GLenum mode, bool hasDepth, bool hasStencil)
+{
+    Fixed f = {};
+    f.topology = Topology(mode);
+    f.depthTest = c.depthTest && hasDepth;
+    f.depthWrite = c.depthTest && hasDepth && c.depthMask;
+    f.depthCompare = Compare(c.depthFunc);
+    f.stencilTest = c.stencilTest && hasStencil;
+    f.fail = StencilOp(c.stencilFail);
+    f.pass = StencilOp(c.stencilPass);
+    f.depthFail = StencilOp(c.stencilDepthFail);
+    f.stencilCompare = Compare(c.stencilFunc);
+    return f;
+}
+
+// Render pass objects: the state and the pass in the pipeline's key
+void FixInKey(const Context& c, const Fixed& f, PipelineKey* key)
+{
+    key->renderPass = c.rendering.renderPass;
+    key->topology = f.topology;
+    key->depthTest = f.depthTest ? 1 : 0;
+    key->depthWrite = f.depthWrite ? 1 : 0;
+    key->depthCompare = f.depthTest ? f.depthCompare : VK_COMPARE_OP_ALWAYS;
+    key->stencilTest = f.stencilTest ? 1 : 0;
+    if (f.stencilTest)
+    {
+        key->stencilOps[0] = f.fail;
+        key->stencilOps[1] = f.pass;
+        key->stencilOps[2] = f.depthFail;
+        key->stencilOps[3] = f.stencilCompare;
+    }
+}
+
+// Dynamic rendering: the state set on the commands
+void SetFixed(VkCommandBuffer commands, const Fixed& f)
+{
+    vkCmdSetDepthTestEnable(commands, f.depthTest ? VK_TRUE : VK_FALSE);
+    vkCmdSetDepthWriteEnable(commands, f.depthWrite ? VK_TRUE : VK_FALSE);
+    vkCmdSetDepthCompareOp(commands, f.depthCompare);
+    vkCmdSetStencilTestEnable(commands, f.stencilTest ? VK_TRUE : VK_FALSE);
+    vkCmdSetStencilOp(commands, VK_STENCIL_FACE_FRONT_AND_BACK, f.fail, f.pass, f.depthFail, f.stencilCompare);
+    vkCmdSetPrimitiveTopology(commands, f.topology);
     vkCmdSetCullMode(commands, VK_CULL_MODE_NONE);
     vkCmdSetFrontFace(commands, VK_FRONT_FACE_COUNTER_CLOCKWISE);
 }
@@ -846,6 +1129,13 @@ void Draw(Context& c, GLenum mode, GLint first, GLsizei count)
 
     key.writeMask = (c.colourMask[0] ? VK_COLOR_COMPONENT_R_BIT : 0) | (c.colourMask[1] ? VK_COLOR_COMPONENT_G_BIT : 0) |
                     (c.colourMask[2] ? VK_COLOR_COMPONENT_B_BIT : 0) | (c.colourMask[3] ? VK_COLOR_COMPONENT_A_BIT : 0);
+    const Fixed fixed = FixedOf(c, mode, hasDepth, hasStencil);
+    const bool passes = GetDevice().renderPasses;
+    if (passes)
+    {
+        FixInKey(c, fixed, &key);
+    }
+
     VkPipeline pipeline = PipelineFor(key);
     if (pipeline == VK_NULL_HANDLE)
     {
@@ -859,6 +1149,11 @@ void Draw(Context& c, GLenum mode, GLint first, GLsizei count)
     }
 
     SetDynamicState(c, a, mode, hasDepth, hasStencil);
+    if (!passes)
+    {
+        SetFixed(commands, fixed);
+    }
+
     if (!BindResources(c, *program, VK_PIPELINE_BIND_POINT_GRAPHICS))
     {
         return;
@@ -1378,6 +1673,20 @@ void BlitOne(Context& c, Texture& source, u32 sourceLevel, const Attachments& de
     key.depthFormat = a.depth != nullptr ? a.depth->format : VK_FORMAT_UNDEFINED;
     key.stencilFormat = a.depth != nullptr && (a.depth->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0 ? a.depth->format : VK_FORMAT_UNDEFINED;
     key.writeMask = 0xF;
+    Fixed fixed = {};
+    fixed.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    fixed.depthTest = depth;
+    fixed.depthWrite = depth;
+    fixed.depthCompare = VK_COMPARE_OP_ALWAYS;
+    fixed.stencilTest = false;
+    fixed.fail = fixed.pass = fixed.depthFail = VK_STENCIL_OP_KEEP;
+    fixed.stencilCompare = VK_COMPARE_OP_ALWAYS;
+    const bool passes = GetDevice().renderPasses;
+    if (passes)
+    {
+        FixInKey(c, fixed, &key);
+    }
+
     VkPipeline pipeline = PipelineFor(key);
     VkCommandBuffer commands = Commands(c);
     vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -1396,17 +1705,14 @@ void BlitOne(Context& c, Texture& source, u32 sourceLevel, const Attachments& de
     VkRect2D scissor = {{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}};
     vkCmdSetScissor(commands, 0, 1, &scissor);
     vkCmdSetBlendConstants(commands, c.blendColour);
-    vkCmdSetDepthTestEnable(commands, depth ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthWriteEnable(commands, depth ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthCompareOp(commands, VK_COMPARE_OP_ALWAYS);
-    vkCmdSetStencilTestEnable(commands, VK_FALSE);
-    vkCmdSetStencilOp(commands, VK_STENCIL_FACE_FRONT_AND_BACK, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
     vkCmdSetStencilCompareMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
     vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
     vkCmdSetStencilReference(commands, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
-    vkCmdSetPrimitiveTopology(commands, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
-    vkCmdSetCullMode(commands, VK_CULL_MODE_NONE);
-    vkCmdSetFrontFace(commands, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    if (!passes)
+    {
+        SetFixed(commands, fixed);
+    }
+
     // The source bound as the program's one sampler (its first unit's texture, for this draw only)
     const GLuint savedTexture = c.textures[0];
     const GLuint savedSampler = c.samplers[0];
@@ -1481,6 +1787,31 @@ void PresentWindow(Context& c)
     if (colour != nullptr)
     {
         PresentImage(c, *colour);
+    }
+}
+
+void ForgetViews(const std::vector<VkImageView>& views)
+{
+    std::lock_guard lock(g_PassesLock);
+    for (VkImageView view : views)
+    {
+        auto found = g_FramebuffersOfView.find(view);
+        if (found == g_FramebuffersOfView.end())
+        {
+            continue;
+        }
+
+        for (const std::string& key : found->second)
+        {
+            auto framebuffer = g_Framebuffers.find(key);
+            if (framebuffer != g_Framebuffers.end())
+            {
+                vkDestroyFramebuffer(GetDevice().device, framebuffer->second, nullptr);
+                g_Framebuffers.erase(framebuffer);
+            }
+        }
+
+        g_FramebuffersOfView.erase(found);
     }
 }
 }

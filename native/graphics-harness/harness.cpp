@@ -290,10 +290,11 @@ int main(int argc, char** argv)
         {
             NativeGraphics::HardwareStats stats = NativeGraphics::GetHardwareStats();
             std::printf("hardware: %llu drawn, %llu left to software, %llu batches, %llu to memory, %llu from memory, %llu CPU "
-                        "readbacks, %llu copies, %llu GPU decodes, %llu content hits\n",
+                        "readbacks, %llu copies, %llu GPU decodes, %llu content hits, %llu atlas fills\n",
                         (unsigned long long)stats.drawn, (unsigned long long)stats.fallbacks, (unsigned long long)stats.batches,
                         (unsigned long long)stats.downloads, (unsigned long long)stats.uploads, (unsigned long long)stats.readbacks,
-                        (unsigned long long)stats.copies, (unsigned long long)stats.decodes, (unsigned long long)stats.contentHits);
+                        (unsigned long long)stats.copies, (unsigned long long)stats.decodes, (unsigned long long)stats.contentHits,
+                        (unsigned long long)stats.atlasFills);
         }
         if (const char* dumpVu1 = std::getenv("TWIN_DUMP_VU1"))
         {

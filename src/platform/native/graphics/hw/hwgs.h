@@ -77,6 +77,8 @@ struct HardwareStats
     // Decodes that read a target's pixels directly (no conversion of the target into memory's copy)
     u64 directDecodes;
     u64 contentHits;
+    // Small textures put in a layer of the atlas (hwgs.cpp's AtlasPlaceFor)
+    u64 atlasFills;
     const char* lastFallback;
     // The render thread's time (nanoseconds) in the batches' flushes (the draws), the textures' decodes, memory's passes
     // (uploads, downloads, the conversions) and the primitives' preparation (Draw)

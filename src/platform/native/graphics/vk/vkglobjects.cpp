@@ -219,6 +219,13 @@ namespace
 void DestroyImage(VkImage image, std::map<u64, VkImageView> views, Allocation memory)
 {
     Device& d = GetDevice();
+    std::vector<VkImageView> gone;
+    for (auto& view : views)
+    {
+        gone.push_back(view.second);
+    }
+
+    ForgetViews(gone);
     for (auto& view : views)
     {
         vkDestroyImageView(d.device, view.second, nullptr);

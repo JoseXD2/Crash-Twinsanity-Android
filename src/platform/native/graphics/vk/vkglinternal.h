@@ -109,6 +109,12 @@ namespace VkGl
     X(vkCmdPipelineBarrier)                                                                                                    \
     X(vkCmdBeginRendering)                                                                                                     \
     X(vkCmdEndRendering)                                                                                                       \
+    X(vkCreateRenderPass)                                                                                                      \
+    X(vkDestroyRenderPass)                                                                                                     \
+    X(vkCreateFramebuffer)                                                                                                     \
+    X(vkDestroyFramebuffer)                                                                                                    \
+    X(vkCmdBeginRenderPass)                                                                                                    \
+    X(vkCmdEndRenderPass)                                                                                                      \
     X(vkCmdBindPipeline)                                                                                                       \
     X(vkCmdBindDescriptorSets)                                                                                                 \
     X(vkCmdBindVertexBuffers)                                                                                                  \
@@ -367,6 +373,11 @@ struct Device
     f32 maxAnisotropy = 1.0f;
     bool wideLines = false;
     bool timestamps = false;
+    // Vulkan 1.1/1.2 (or 1.3 without dynamic rendering): render pass objects and framebuffers, the depth and stencil state baked
+    // into the pipelines (vkgldraw.cpp)
+    bool renderPasses = false;
+    // The device lost (VK_ERROR_DEVICE_LOST): every submission counts as done, nothing waits on the GPU any more
+    bool lost = false;
     f32 timestampPeriod = 1.0f;
     VkPipelineCache pipelineCache = VK_NULL_HANDLE;
     // The queue's submissions by number: the last submitted, and the last known done
@@ -383,6 +394,7 @@ void Free(Allocation& allocation);
 
 // The queue's submissions done so far (fences polled), and a wait for one
 u64 CompletedSerial();
+void DeviceLost();
 void WaitSerial(u64 serial);
 // Work to do once a submission is done (a deletion: the GPU may still read the object)
 void AfterSerial(u64 serial, std::function<void()> work);
@@ -599,6 +611,8 @@ struct Rendering
     VkImage depthImage = VK_NULL_HANDLE;
     u32 width = 0;
     u32 height = 0;
+    // (render pass objects: the pass the pipelines are made compatible with)
+    VkRenderPass renderPass = VK_NULL_HANDLE;
 };
 
 struct Context
@@ -689,6 +703,9 @@ void WindowSize(int* width, int* height);
 // The framebuffer GL means by a binding (0: the context's default one)
 Framebuffer* DrawFramebuffer(Context& c);
 Framebuffer* ReadFramebuffer(Context& c);
+
+// The framebuffers made of an image's views gone with them (render pass objects: vkgldraw.cpp's cache), before the views go
+void ForgetViews(const std::vector<VkImageView>& views);
 
 // The draws (vkgldraw.cpp)
 void Draw(Context& c, GLenum mode, GLint first, GLsizei count);

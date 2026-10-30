@@ -163,6 +163,10 @@ bool LoadGl()
     g_Gl.MapBufferRange = reinterpret_cast<void* (*)(GLenum, std::ptrdiff_t, GLsizeiptr, GLbitfield)>(NativeGl::GetProcAddress("glMapBufferRange"));
     g_Gl.BufferSubData = reinterpret_cast<void (*)(GLenum, std::ptrdiff_t, GLsizeiptr, const void*)>(NativeGl::GetProcAddress("glBufferSubData"));
     g_Gl.UnmapBuffer = reinterpret_cast<GLboolean (*)(GLenum)>(NativeGl::GetProcAddress("glUnmapBuffer"));
+    g_Gl.TexImage3D = reinterpret_cast<void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*)>(
+        NativeGl::GetProcAddress("glTexImage3D"));
+    g_Gl.FramebufferTextureLayer =
+        reinterpret_cast<void (*)(GLenum, GLenum, GLuint, GLint, GLint)>(NativeGl::GetProcAddress("glFramebufferTextureLayer"));
     g_Gl.GetString = reinterpret_cast<const unsigned char* (*)(GLenum)>(NativeGl::GetProcAddress("glGetString"));
     // (optional: the timer queries, the EXT's entry points on ES)
     g_Gl.GenQueries = nullptr;

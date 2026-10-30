@@ -441,6 +441,16 @@ SDL_Window* GameWindow()
 
     // (vulkan_starting.txt: made before a start with Vulkan, gone once it has shown a few seconds of pictures; there at a start, the
     // last one with Vulkan didn't get that far, so OpenGL, the option too)
+    // (vulkan_failed.txt: the GPU's driver failed with Vulkan here (vkgldevice.cpp's DeviceLost): OpenGL, the option too)
+    const std::string failed = Native::SettingsFolder() + "/vulkan_failed.txt";
+    if (vulkan && std::filesystem::exists(failed, missing))
+    {
+        Native::Log("graphics: Vulkan failed on this phone before (vulkan_failed.txt): OpenGL from now on");
+        std::filesystem::remove(failed, missing);
+        NativeUi::PresetOption(NativeUi::OptionRenderer, 0);
+        vulkan = false;
+    }
+
     const std::string starting = Native::SettingsFolder() + "/vulkan_starting.txt";
     if (vulkan && std::filesystem::exists(starting, missing))
     {

@@ -849,12 +849,17 @@ void ReadTouchControls(BoundPad* pad)
         SDL_free(windows);
     }
 
+    // The native options read the controls themselves (TouchMenuPad: their state is the options' then); the game's own menus
+    // answer the buttons as in play. Turned off, or being laid out, nothing is read
+    if (SettingsOpen())
+    {
+        return;
+    }
+
     g_Buttons = 0;
     g_StickHeld = false;
     g_CameraHeld = false;
-    // The native options take the touches as the mouse's (SDL's); the game's own menus answer the buttons as in play. Turned off,
-    // or being laid out, nothing is read
-    if (SettingsOpen() || g_Editing || g_PixelWidth <= 0 || !IsOn(OptionTouchControls))
+    if (g_Editing || g_PixelWidth <= 0 || !IsOn(OptionTouchControls))
     {
         return;
     }
@@ -918,6 +923,45 @@ void ReadTouchControls(BoundPad* pad)
     }
 }
 
+bool TouchPadDrivesOptions()
+{
+    return TouchControlsEnabled() && IsOn(OptionTouchControls);
+}
+
+void TouchMenuPad(u32* buttons, f32* stickX, f32* stickY)
+{
+    std::lock_guard lock(g_Lock);
+    g_Buttons = 0;
+    g_StickHeld = false;
+    g_CameraHeld = false;
+    g_StickX = 0.0f;
+    g_StickY = 0.0f;
+    if (!g_Editing && g_PixelWidth > 0 && IsOn(OptionTouchControls))
+    {
+        const f32 stickRadius = StickRadius * OptionScale() * g_Placements[static_cast<u32>(Group::Stick)].scale;
+        for (const Finger& f : g_Fingers)
+        {
+            if (f.role == Role::Button && f.control >= 0)
+            {
+                g_Buttons |= ControlBits[f.control];
+            }
+            else if (f.role == Role::Stick)
+            {
+                u8 x;
+                u8 y;
+                StickBytes(f.x - f.startX, f.y - f.startY, stickRadius, &x, &y, &g_StickX, &g_StickY);
+                g_StickCentreX = f.startX;
+                g_StickCentreY = f.startY;
+                g_StickHeld = true;
+            }
+        }
+    }
+
+    *buttons = g_Buttons;
+    *stickX = g_StickX;
+    *stickY = g_StickY;
+}
+
 void AddTouchControls(std::vector<OverlayFrame::Command>* commands, int pixelWidth, int pixelHeight)
 {
     if (!TouchControlsEnabled() || pixelWidth <= 0 || pixelHeight <= 0)
@@ -930,7 +974,7 @@ void AddTouchControls(std::vector<OverlayFrame::Command>* commands, int pixelWid
     g_PixelHeight = pixelHeight;
     if (!g_Editing)
     {
-        if (SettingsOpen() || !IsOn(OptionTouchControls))
+        if (!IsOn(OptionTouchControls))
         {
             return;
         }

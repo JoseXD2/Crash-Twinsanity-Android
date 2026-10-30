@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -251,6 +252,11 @@ struct HwVertex
     f32 t;
     f32 q;
     f32 fog;
+    // The texture atlas's (a texture drawn from a layer of an atlas array, BitAtlas): the layer, LOD's K in 16ths, L (-1: K is the
+    // LOD, as LCM's constant or no mipmaps) and the highest level; zeroes otherwise
+    s16 atlas[4];
+    // Its alpha test (an atlas texture's, when no failed pixel is drawn: the batch goes on across tests): ATST, 8 none; AREF
+    s16 alphaTest[2];
 };
 
 // What a batch draws with: everything that changes GL's state or the shader's uniforms (compared as bytes)
@@ -392,6 +398,9 @@ enum ProgramBits : u32
     BitFrame24 = 1u << 21,
     BitWrapAdd = 1u << 22,
     BitNativeDepth = 1u << 23,
+    // The texture a layer of an atlas array (the small textures together: the batch goes on across them), its coordinates in
+    // texels already and its LOD's parameters the vertex's
+    BitAtlas = 1u << 24,
 };
 
 constexpr const char* VertexSource = R"(#version 330 core
@@ -400,6 +409,12 @@ layout(location = 1) in uint aZ;
 layout(location = 2) in vec4 aColour;
 layout(location = 3) in vec3 aStq;
 layout(location = 4) in float aFog;
+#if ATLAS
+layout(location = 5) in vec4 aAtlas;
+layout(location = 6) in vec2 aAlphaTest;
+flat out vec4 vAtlas;
+flat out vec2 vAlphaTest;
+#endif
 uniform vec2 viewSize;
 uniform vec2 viewOrigin;
 uniform float zMax;
@@ -417,6 +432,10 @@ void main()
     vColour = aColour;
     vStq = aStq;
     vFog = aFog;
+#if ATLAS
+    vAtlas = aAtlas;
+    vAlphaTest = aAlphaTest;
+#endif
     // Depth as a float of the GS's value over 2^32 (exact below 2^24), or for a reversed target 2^32 - 1 less it (exact near
     // the top)
     vDepth = depthReverse != 0 ? float(0xFFFFFFFFu - min(aZ, zMaxU)) * (1.0 / 4294967296.0) : min(float(aZ), zMax) * (1.0 / 4294967296.0);
@@ -430,7 +449,13 @@ noperspective in float vFog;
 noperspective in float vDepth;
 layout(location = 0, index = 0) out vec4 outColour;
 layout(location = 0, index = 1) out vec4 outFactor;
+#if ATLAS
+flat in vec4 vAtlas;
+flat in vec2 vAlphaTest;
+uniform sampler2DArray tex;
+#else
 uniform sampler2D tex;
+#endif
 uniform vec2 texSize;
 uniform vec2 texActual;
 uniform float texSnap;
@@ -513,7 +538,14 @@ void main()
     }
 #endif
     float lod = 0.0;
-#if MIPMAP
+#if ATLAS
+    lod = vAtlas.y / 16.0;
+    if (vAtlas.z >= 0.0)
+    {
+        lod += log2(1.0 / abs(vStq.z)) * exp2(vAtlas.z);
+    }
+    lod = min(lod, vAtlas.w);
+#elif MIPMAP
 #if LODCONST
     lod = lodK;
 #else
@@ -527,7 +559,11 @@ void main()
     {
         uv = floor(uv) + 0.5 / texSnap;
     }
+#if ATLAS
+    vec4 t = floor(textureLod(tex, vec3(uv / texActual, vAtlas.x), lod) * 255.0 + 0.5);
+#else
     vec4 t = floor(textureLod(tex, uv / texActual, lod) * 255.0 + 0.5);
+#endif
 #if TEXALPHA == 1
     t.a = (aem != 0 && t.r + t.g + t.b == 0.0) ? 0.0 : ta0;
 #elif TEXALPHA == 2
@@ -568,6 +604,19 @@ void main()
 #else
     rgb = floor(c.rgb);
     a = floor(c.a);
+#endif
+#if ATLAS && !ALPHATEST
+    // The vertex's alpha test (no failed pixel drawn)
+    {
+        int mode = int(vAlphaTest.x);
+        float r = vAlphaTest.y;
+        bool pass = mode == 0 ? false : mode == 2 ? a < r : mode == 3 ? a <= r : mode == 4 ? a == r : mode == 5 ? a >= r : mode == 6 ? a > r
+                  : mode == 7 ? a != r : true;
+        if (!pass)
+        {
+            discard;
+        }
+    }
 #endif
 #if ALPHATEST
     bool pass;
@@ -1134,6 +1183,29 @@ void main()
 )";
 
 // Copies by drawing (a blit makes Apple's OpenGL submit its work and wait): a texture's texels at the same places
+// The atlas's fill: a layer's level made of a content texture's level, repeated (params.w bit 0 across, bit 1 down) or its
+// edge drawn out
+constexpr const char* AtlasVertexSource = R"(#version 330 core
+void main()
+{
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+constexpr const char* AtlasFillSource = R"(#version 330 core
+uniform sampler2D source;
+uniform uvec4 params;
+out vec4 colour;
+void main()
+{
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 size = ivec2(params.xy);
+    ivec2 q = ivec2((params.w & 1u) != 0u ? p.x % size.x : min(p.x, size.x - 1), (params.w & 2u) != 0u ? p.y % size.y : min(p.y, size.y - 1));
+    colour = texelFetch(source, q, int(params.z));
+}
+)";
+
 constexpr const char* CopyColourSource = R"(#version 330 core
 uniform sampler2D source;
 out vec4 colour;
@@ -1461,6 +1533,8 @@ public:
     // The batches' vertex arrays (attributes 0-4 of HwVertex) on a buffer; the measuring's end of a batch (way 0 a buffer a batch,
     // 1 the pool)
     void SetUpVertexArray(GLuint vertexArray, GLuint buffer);
+    // A content texture's layer in an atlas array with its wrap modes (made and filled the first time); false when it can't be
+    bool AtlasPlaceFor(GLuint texture, GLenum wrapS, GLenum wrapT, u32* array, u32* layer);
     void EndTrialBatch(int way, u64 ns);
     bool PagesGpuNewer(const Gs::PageSet& pages) override
     {
@@ -1572,6 +1646,51 @@ private:
     u32 mergeWidth_ = 0;
     u32 mergeHeight_ = 0;
     GLuint emptyArray_ = 0;
+    // The texture atlas (BitAtlas; $TWIN_HW_ATLAS=0 turns it off): arrays of AtlasSize x AtlasSize layers with all their levels,
+    // each layer one small content texture (decoded once from the CPU's data, never changed) repeated across the layer along an
+    // axis that repeats and its edge drawn out along one that clamps, so the layer sampled with the texture's wrap is the
+    // texture. A batch goes on across the textures of an array (the Poco F5's forest: a batch for nearly every texture before,
+    // Qualcomm's driver ~0.12 ms each). Arrays by wrap modes, AtlasLayers layers each; all of them full, the places start again
+    static constexpr u32 AtlasSize = 128;
+    static constexpr u32 AtlasLevels = 8;
+    static constexpr u32 AtlasLayers = 64;
+    static constexpr u32 AtlasArrays = 8;
+    struct AtlasArray
+    {
+        GLuint id = 0;
+        GLenum wrapS = 0;
+        GLenum wrapT = 0;
+        u32 used = 0;
+    };
+    std::vector<AtlasArray> atlases_;
+    struct AtlasPlace
+    {
+        u32 array = 0;
+        u32 layer = 0;
+    };
+    std::unordered_map<u64, AtlasPlace> atlasPlaces_;
+    struct ContentSize
+    {
+        u32 width = 0;
+        u32 height = 0;
+        u32 levels = 0;
+    };
+    std::unordered_map<GLuint, ContentSize> contentSizes_;
+    bool atlasOn_ = false;
+    GLuint atlasFbo_ = 0;
+    GLuint atlasProgram_ = 0;
+    GLint atlasSource_ = -1;
+    GLint atlasParams_ = -1;
+    // The draw's atlas texture, for its vertexes (AddPrimitive), kept for the primitives drawn like it (DrawLikeLast)
+    struct AtlasVertex
+    {
+        bool on = false;
+        bool uv = false;
+        f32 width = 1.0f;
+        f32 height = 1.0f;
+        s16 values[4] = {};
+        s16 alphaTest[2] = {8, 0};
+    } atlasVertex_;
     // Staging textures by size and kind (1x), and the copy of a target sampled while it's drawn into
     std::map<std::tuple<u32, u32, bool>, std::pair<GLuint, GLuint>> staging_;
     std::map<std::tuple<u32, u32>, std::pair<GLuint, GLuint>> copies_;
@@ -1910,10 +2029,115 @@ void HwGs::SetUpVertexArray(GLuint vertexArray, GLuint buffer)
     gl.VertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, r)));
     gl.VertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, s)));
     gl.VertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, fog)));
-    for (GLuint i = 0; i < 5; i++)
+    gl.VertexAttribPointer(5, 4, GL_SHORT, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, atlas)));
+    gl.VertexAttribPointer(6, 2, GL_SHORT, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, alphaTest)));
+    for (GLuint i = 0; i < 7; i++)
     {
         gl.EnableVertexAttribArray(i);
     }
+}
+
+bool HwGs::AtlasPlaceFor(GLuint texture, GLenum wrapS, GLenum wrapT, u32* arrayIndex, u32* layerIndex)
+{
+    const u64 placeKey = static_cast<u64>(texture) << 2 | (wrapS == GL_REPEAT ? 1u : 0u) | (wrapT == GL_REPEAT ? 2u : 0u);
+    auto known = atlasPlaces_.find(placeKey);
+    if (known != atlasPlaces_.end())
+    {
+        *arrayIndex = known->second.array;
+        *layerIndex = known->second.layer;
+        return true;
+    }
+
+    auto size = contentSizes_.find(texture);
+    if (size == contentSizes_.end())
+    {
+        return false;
+    }
+
+    Gl& gl = GetGl();
+    // An array of the wrap modes with a layer free, else a new one, else every place given up (the batch drawn first: it may
+    // sample them) and the arrays' layers used again
+    auto findFree = [&]() -> s32
+    {
+        for (u32 i = 0; i < atlases_.size(); i++)
+        {
+            if (atlases_[i].wrapS == wrapS && atlases_[i].wrapT == wrapT && atlases_[i].used < AtlasLayers)
+            {
+                return static_cast<s32>(i);
+            }
+        }
+
+        return -1;
+    };
+    s32 chosen = findFree();
+    if (chosen < 0 && atlases_.size() < AtlasArrays)
+    {
+        AtlasArray made;
+        made.wrapS = wrapS;
+        made.wrapT = wrapT;
+        gl.GenTextures(1, &made.id);
+        gl.BindTexture(GL_TEXTURE_2D_ARRAY, made.id);
+        for (u32 level = 0; level < AtlasLevels; level++)
+        {
+            gl.TexImage3D(GL_TEXTURE_2D_ARRAY, static_cast<GLint>(level), static_cast<GLint>(GL_RGBA8), static_cast<GLsizei>(AtlasSize >> level),
+                          static_cast<GLsizei>(AtlasSize >> level), static_cast<GLsizei>(AtlasLayers), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        }
+
+        gl.TexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_BASE_LEVEL, 0);
+        gl.TexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(AtlasLevels - 1));
+        atlases_.push_back(made);
+        chosen = static_cast<s32>(atlases_.size() - 1);
+    }
+
+    if (chosen < 0)
+    {
+        Flush();
+        atlasPlaces_.clear();
+        for (AtlasArray& a : atlases_)
+        {
+            a.used = 0;
+        }
+
+        chosen = findFree();
+        if (chosen < 0)
+        {
+            return false;
+        }
+    }
+
+    AtlasArray& a = atlases_[static_cast<size_t>(chosen)];
+    const u32 layer = a.used++;
+    // The layer's levels drawn from the texture's (those the texture hasn't are never sampled: its LOD stops at its last)
+    Flush();
+    const ContentSize& c = size->second;
+    gl.BindFramebuffer(GL_FRAMEBUFFER, atlasFbo_);
+    gl.Disable(GL_SCISSOR_TEST);
+    gl.Disable(GL_DEPTH_TEST);
+    gl.Disable(GL_STENCIL_TEST);
+    gl.Disable(GL_BLEND);
+    gl.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl.BindVertexArray(emptyArray_);
+    gl.UseProgram(atlasProgram_);
+    gl.ActiveTexture(GL_TEXTURE0 + 5);
+    gl.BindTexture(GL_TEXTURE_2D, texture);
+    gl.BindSampler(5, 0);
+    gl.Uniform1i(atlasSource_, 5);
+    const u32 repeat = (wrapS == GL_REPEAT ? 1u : 0u) | (wrapT == GL_REPEAT ? 2u : 0u);
+    for (u32 level = 0; level < std::min(c.levels, AtlasLevels); level++)
+    {
+        gl.FramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, a.id, static_cast<GLint>(level), static_cast<GLint>(layer));
+        Pass((3ull << 40) | (static_cast<u64>(a.id) << 16) | (static_cast<u64>(layer) << 4) | level, "atlas fill");
+        gl.Viewport(0, 0, static_cast<GLsizei>(AtlasSize >> level), static_cast<GLsizei>(AtlasSize >> level));
+        gl.Uniform4ui(atlasParams_, std::max(1u, c.width >> level), std::max(1u, c.height >> level), level, repeat);
+        gl.DrawArrays(GL_TRIANGLES, 0, 3);
+    }
+
+    gl.ActiveTexture(GL_TEXTURE0);
+    atlasPlaces_[placeKey] = {static_cast<u32>(chosen), layer};
+    stats.atlasFills++;
+    *arrayIndex = static_cast<u32>(chosen);
+    *layerIndex = layer;
+    return true;
 }
 
 void HwGs::EndTrialBatch(int way, u64 ns)
@@ -2069,12 +2293,15 @@ const Program& HwGs::ProgramFor(u32 bits)
     define("FRAME24", (bits & BitFrame24) ? 1 : 0);
     define("WRAPADD", (bits & BitWrapAdd) ? 1 : 0);
     define("NATIVEDEPTH", (bits & BitNativeDepth) ? 1 : 0);
+    define("ATLAS", (bits & BitAtlas) ? 1 : 0);
     // The shader blend's destination: the framebuffer's own pixel where the GPU lets a fragment shader read it (OpenGL ES with
     // GL_EXT_shader_framebuffer_fetch: no copy of the target before the batch), else the copy made before the batch
     bool fetch = (bits & BitShaderBlend) && NativeGl::ShaderBlendByFetch();
     define("FBFETCH", fetch ? 1 : 0);
     header += fetch ? "#define DESTINATION outColour\n" : "#define DESTINATION texelFetch(destination, ivec2(gl_FragCoord.xy), 0)\n";
-    GLuint vertex = CompileShader(GL_VERTEX_SHADER, VertexSource);
+    // (the vertex shader with the same defines: the atlas's attribute only where it's read)
+    const std::string vertexBody = VertexSource;
+    GLuint vertex = CompileShader(GL_VERTEX_SHADER, header + vertexBody.substr(vertexBody.find('\n') + 1));
     GLuint fragment = CompileShader(GL_FRAGMENT_SHADER, header + FragmentSource);
     Gl& gl = GetGl();
     Program p;
@@ -2696,6 +2923,25 @@ void HwGs::InitMemory()
                                                CompileShader(GL_FRAGMENT_SHADER, header + MemCommonSource + TargetReadSource + direct), false);
     }
     gl.GenFramebuffers(1, &decodeFbo_);
+    // The texture atlas: OpenGL's own (VkGl has no array textures yet)
+    {
+        const char* wanted = std::getenv("TWIN_HW_ATLAS");
+        // (or an atlas_off.txt in the settings folder, for a phone)
+        std::error_code missing;
+        const bool fileOff = std::filesystem::exists(Native::SettingsFolder() + "/atlas_off.txt", missing);
+        atlasOn_ = (wanted == nullptr || wanted[0] != '0') && !fileOff && !NativeGl::Vulkan() && gl.TexImage3D != nullptr &&
+                   gl.FramebufferTextureLayer != nullptr;
+        if (atlasOn_)
+        {
+            gl.GenFramebuffers(1, &atlasFbo_);
+            atlasProgram_ = LinkProgram(CompileShader(GL_VERTEX_SHADER, AtlasVertexSource), CompileShader(GL_FRAGMENT_SHADER, AtlasFillSource),
+                                        false);
+            atlasSource_ = gl.GetUniformLocation(atlasProgram_, "source");
+            atlasParams_ = gl.GetUniformLocation(atlasProgram_, "params");
+        }
+
+        Native::Log("graphics: the texture atlas %s", atlasOn_ ? "on" : "off");
+    }
     gl.GenTextures(1, &clutTexture_);
     gl.BindTexture(GL_TEXTURE_2D, clutTexture_);
     gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -2967,6 +3213,7 @@ GLuint HwGs::DecodeOnGpu(const Gs::Gs::DrawState& state, s32 left, s32 top, s32 
             Flush();
             SyncMem(t.pages);
             c.id = MakeLevels(state);
+            contentSizes_[c.id] = {base.width, base.height, state.levelCount};
             Rect all[7];
             for (u32 i = 0; i < t.levelCount; i++)
             {
@@ -4848,7 +5095,8 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
     }
 
     key.colclamp = state.colclamp ? 1 : 0;
-    key.datm = state.datm;
+    // (DATM only where the destination alpha test is on: a draw without it doesn't break the batch over a register it doesn't use)
+    key.datm = state.date ? state.datm : 0;
     key.stencilDate = stencilDate ? 1 : 0;
 
     // A glyph image's sprite (the UI's glyphs)
@@ -4917,6 +5165,7 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
     bool textureFromScaled = false;
     GLuint texture = 0;
     u32 texAlpha = 0;
+    atlasVertex_.on = false;
     if (state.textured)
     {
         const Gs::TextureLevel& level = state.levels[0];
@@ -5289,6 +5538,44 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
 
         program |= texAlpha << BitTexAlphaShift;
         key.texture = texture;
+        // A small content texture: drawn from its layer of an atlas array, the batch going on across the array's textures (the
+        // texel coordinates and the LOD's parameters the vertexes', the sampler's minification a mipmap one for any texture:
+        // level 0 alone where its LOD stops there)
+        atlasVertex_.on = false;
+        if (atlasOn_ && key.texSnap == 0)
+        {
+            auto size = contentSizes_.find(texture);
+            u32 array = 0;
+            u32 layer = 0;
+            if (size != contentSizes_.end() && size->second.width <= AtlasSize && size->second.height <= AtlasSize &&
+                AtlasPlaceFor(texture, key.wrapS, key.wrapT, &array, &layer))
+            {
+                const bool mip = (program & BitMipmap) != 0;
+                const bool constant = !mip || (program & BitLodConstant) != 0;
+                atlasVertex_.on = true;
+                atlasVertex_.uv = state.uv;
+                atlasVertex_.width = key.gsTexWidth;
+                atlasVertex_.height = key.gsTexHeight;
+                atlasVertex_.values[0] = static_cast<s16>(layer);
+                atlasVertex_.values[1] = mip ? static_cast<s16>(std::lround(key.lodK * 16.0f)) : 0;
+                atlasVertex_.values[2] = constant ? -1 : static_cast<s16>(key.lodL);
+                atlasVertex_.values[3] = mip ? static_cast<s16>(std::min(key.mxl, size->second.levels - 1)) : 0;
+                program = (program & ~(BitMipmap | BitLodConstant)) | BitAtlas;
+                key.texture = atlases_[array].id;
+                key.texWidth = static_cast<f32>(AtlasSize);
+                key.texHeight = static_cast<f32>(AtlasSize);
+                key.gsTexWidth = 1.0f;
+                key.gsTexHeight = 1.0f;
+                key.maxLevel = 0;
+                key.lodK = 0.0f;
+                key.lodL = 0;
+                key.mxl = 0;
+                if (!mip)
+                {
+                    key.minFilter = key.magFilter == GL_LINEAR ? GL_LINEAR_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_NEAREST;
+                }
+            }
+        }
         if (texAlpha != 0)
         {
             Gs::RegTexa texa = gs_.texa();
@@ -5401,6 +5688,23 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
         key.alphaTested = 1;
     }
 
+    // An atlas texture's alpha test the vertexes' where no failed pixel is drawn (else the program's, and its fail pass)
+    atlasVertex_.alphaTest[0] = 8;
+    atlasVertex_.alphaTest[1] = 0;
+    if (atlasVertex_.on && (key.alphaTested == 0 || key.afail == Gs::AfailKeep))
+    {
+        if (key.alphaTested != 0)
+        {
+            atlasVertex_.alphaTest[0] = static_cast<s16>(state.atst);
+            atlasVertex_.alphaTest[1] = static_cast<s16>(state.aref);
+        }
+
+        program &= ~(BitAlphaTest | (7u << BitAtstShift));
+        key.aref = 0;
+        key.afail = 0;
+        key.alphaTested = 0;
+    }
+
     key.colourMask = (maskBytes[0] == 0 ? 1 : 0) | (maskBytes[1] == 0 ? 2 : 0) | (maskBytes[2] == 0 ? 4 : 0) |
                      (maskBytes[3] == 0 ? 8 : 0);
     if (frame16)
@@ -5423,6 +5727,20 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
     const bool sameKey = batching_ && SameBatchKey(key, key_);
     if (batching_ && !sameKey)
     {
+        // ($TWIN_HW_BATCH_DUMP: every batch end, its key's changes in full, for the batching's work)
+        static const bool dumping = std::getenv("TWIN_HW_BATCH_DUMP") != nullptr;
+        if (dumping)
+        {
+            std::fprintf(stderr, "batchwhy: %s\n", BatchKeyDifference(key, key_).c_str());
+            std::fprintf(stderr, "batchend: n=%zu prog %06x->%06x xor %06x tex %u->%u size %gx%g->%gx%g filt %u/%u->%u/%u maxl %u->%u wrap %u/%u->%u/%u blend %u->%u gs %u%u%u%u->%u%u%u%u colour %p->%p atst %u/%u->%u/%u\n",
+                         vertexes_.size(), key_.program, key.program, key_.program ^ key.program, key_.texture, key.texture, key_.texWidth,
+                         key_.texHeight, key.texWidth, key.texHeight, key_.minFilter, key_.magFilter, key.minFilter, key.magFilter,
+                         key_.maxLevel, key.maxLevel, key_.wrapS, key_.wrapT, key.wrapS, key.wrapT, key_.blend, key.blend, key_.gsBlend[0],
+                         key_.gsBlend[1], key_.gsBlend[2], key_.gsBlend[3], key.gsBlend[0], key.gsBlend[1], key.gsBlend[2], key.gsBlend[3],
+                         static_cast<void*>(key_.colour), static_cast<void*>(key.colour), key_.aref, key_.alphaTested, key.aref,
+                         key.alphaTested);
+        }
+
         // (TWIN_HW_STATS: why batches end, by the key's fields that changed, every 3000)
         static const bool counting = std::getenv("TWIN_HW_STATS") != nullptr;
         if (counting)
@@ -5681,7 +5999,16 @@ void HwGs::AddPrimitive(const Gs::Gs::DrawState& state, const Gs::Vertex* vertex
         }
 
         out.fog = static_cast<f32>(v.f);
+        std::memcpy(out.atlas, atlasVertex_.values, sizeof(out.atlas));
+        std::memcpy(out.alphaTest, atlasVertex_.alphaTest, sizeof(out.alphaTest));
+        if (!atlasVertex_.on)
+        {
+            std::memset(out.atlas, 0, sizeof(out.atlas));
+            out.alphaTest[0] = 8;
+            out.alphaTest[1] = 0;
+        }
     };
+    const size_t firstNew = vertexes_.size();
 
     switch (state.type)
     {
@@ -5778,6 +6105,16 @@ void HwGs::AddPrimitive(const Gs::Gs::DrawState& state, const Gs::Vertex* vertex
 
         break;
     }
+    }
+
+    // An atlas texture's STQ coordinates in texels (the batch's textures' sizes differ: texSize is 1 for it)
+    if (atlasVertex_.on && !atlasVertex_.uv)
+    {
+        for (size_t i = firstNew; i < vertexes_.size(); i++)
+        {
+            vertexes_[i].s *= atlasVertex_.width;
+            vertexes_[i].t *= atlasVertex_.height;
+        }
     }
 
     MarkDrawn(colour, drawnPages);
@@ -6153,7 +6490,7 @@ void HwGs::Flush()
     if (k.texture != 0)
     {
         gl.ActiveTexture(GL_TEXTURE0);
-        gl.BindTexture(GL_TEXTURE_2D, k.texture);
+        gl.BindTexture((k.program & BitAtlas) != 0 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D, k.texture);
         // The batch's filters and wraps as a sampler object (made once for each combination): one bind in place of five
         // parameter calls on the texture, which cost a mobile driver a revalidation of it each
         gl.BindSampler(0, SamplerFor(k.minFilter, k.magFilter, k.wrapS, k.wrapT, k.anisotropy));

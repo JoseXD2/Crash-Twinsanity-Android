@@ -373,7 +373,7 @@ std::string Shader(const std::string& given)
     }
 
     head += "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\nprecision highp usampler2D;\n"
-            "precision highp isampler2D;\n";
+            "precision highp isampler2D;\nprecision highp sampler2DArray;\n";
     size_t version = text.find("#version 330 core");
     if (version != std::string::npos)
     {

@@ -142,6 +142,9 @@ struct Gl
     void (*BufferSubData)(GLenum, std::ptrdiff_t, GLsizeiptr, const void*);
     GLboolean (*UnmapBuffer)(GLenum);
     const unsigned char* (*GetString)(GLenum);
+    // The texture atlas's (hwgs.cpp: arrays of the small textures' layers); null where they're not loaded
+    void (*TexImage3D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*);
+    void (*FramebufferTextureLayer)(GLenum, GLenum, GLuint, GLint, GLint);
 };
 
 // The entry points (loaded the first time, with a context current); false when one is missing
@@ -152,7 +155,7 @@ void DrawNone(Gl& gl);
 // Whether the context is OpenGL ES, and its extensions the renderer asks about (asked of the context LoadGl loaded on)
 bool IsEs();
 bool HasAnisotropy();
-constexpr GLenum GL_DYNAMIC_DRAW = 0x88E8, GL_MAP_WRITE_BIT = 0x0002, GL_MAP_INVALIDATE_RANGE_BIT = 0x0004, GL_MAP_UNSYNCHRONIZED_BIT = 0x0020,
+constexpr GLenum GL_TEXTURE_2D_ARRAY = 0x8C1A, GL_SHORT = 0x1402, GL_DYNAMIC_DRAW = 0x88E8, GL_MAP_WRITE_BIT = 0x0002, GL_MAP_INVALIDATE_RANGE_BIT = 0x0004, GL_MAP_UNSYNCHRONIZED_BIT = 0x0020,
                  GL_RENDERER = 0x1F01;
 constexpr GLenum GL_IMPLEMENTATION_COLOR_READ_FORMAT = 0x8B9B, GL_IMPLEMENTATION_COLOR_READ_TYPE = 0x8B9A, GL_RGBA_INTEGER = 0x8D99;
 }

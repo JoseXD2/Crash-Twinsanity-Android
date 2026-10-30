@@ -22,6 +22,7 @@
 #include <SDL3/SDL.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -445,6 +446,8 @@ bool OnPadColumn()
 // Changes of the page (the view's cross-fade)
 u32 g_PageChanges = 0;
 
+void WatchMouse(SDL_Event* event);
+
 bool WatchSettings(void*, SDL_Event* event)
 {
     if (!g_Open)
@@ -593,6 +596,29 @@ bool WatchSettings(void*, SDL_Event* event)
 
         break;
     case SDL_EVENT_MOUSE_MOTION:
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+    case SDL_EVENT_MOUSE_WHEEL:
+        // A phone's touches aren't the options' pointer while the touch controls drive them (as a pad does the game's menus)
+        if (TouchPadDrivesOptions())
+        {
+            break;
+        }
+
+        WatchMouse(event);
+        break;
+    default:
+        break;
+    }
+
+    return true;
+}
+
+void WatchMouse(SDL_Event* event)
+{
+    switch (event->type)
+    {
+    case SDL_EVENT_MOUSE_MOTION:
         WindowToReference(event->motion.x, event->motion.y, &g_MouseX, &g_MouseY);
         g_MouseMoved = true;
         break;
@@ -652,8 +678,6 @@ bool WatchSettings(void*, SDL_Event* event)
     default:
         break;
     }
-
-    return true;
 }
 
 // The stick and a held D-pad step as the keyboard's repeat does
@@ -699,6 +723,81 @@ void PollHeldDirections()
     {
         Act(static_cast<UiAction>(direction));
         g_RepeatAt = now + std::chrono::milliseconds(80);
+    }
+}
+
+// The touch controls as the options' pad (a phone's): the buttons as a pad's (cross picks, circle and triangle go back, square
+// clears, the shoulders change the tab, start goes back), the stick's push as the D-pad's, repeated as held
+void PollTouchPad()
+{
+    static u32 last = 0;
+    static s32 heldDirection = -1;
+    static std::chrono::steady_clock::time_point repeatAt;
+    if (!TouchPadDrivesOptions())
+    {
+        last = 0;
+        heldDirection = -1;
+        return;
+    }
+
+    u32 buttons = 0;
+    f32 x = 0.0f;
+    f32 y = 0.0f;
+    TouchMenuPad(&buttons, &x, &y);
+    const u32 pressed = buttons & ~last;
+    last = buttons;
+    if (pressed != 0 && g_Capturing)
+    {
+        // (a binding's capture isn't the touch controls': it's let go)
+        g_Capturing = false;
+        return;
+    }
+
+    if ((pressed & PadBitCross) != 0)
+    {
+        Act(UiConfirm);
+    }
+
+    if ((pressed & (PadBitCircle | PadBitTriangle | PadBitStart)) != 0)
+    {
+        Act(UiBack);
+    }
+
+    if ((pressed & PadBitSquare) != 0)
+    {
+        Act(UiClear);
+    }
+
+    if ((pressed & (PadBitL1 | PadBitL2)) != 0)
+    {
+        Act(UiTabPrevious);
+    }
+
+    if ((pressed & (PadBitR1 | PadBitR2)) != 0)
+    {
+        Act(UiTabNext);
+    }
+
+    constexpr f32 Pushed = 0.5f;
+    const s32 direction = std::fabs(y) >= std::fabs(x) ? (y < -Pushed ? UiUp : y > Pushed ? UiDown : -1)
+                                                       : (x < -Pushed ? UiLeft : x > Pushed ? UiRight : -1);
+    const auto now = std::chrono::steady_clock::now();
+    if (direction < 0)
+    {
+        heldDirection = -1;
+        return;
+    }
+
+    if (direction != heldDirection)
+    {
+        Act(static_cast<UiAction>(direction));
+        heldDirection = direction;
+        repeatAt = now + std::chrono::milliseconds(400);
+    }
+    else if (now >= repeatAt)
+    {
+        Act(static_cast<UiAction>(direction));
+        repeatAt = now + std::chrono::milliseconds(120);
     }
 }
 
@@ -1198,6 +1297,7 @@ void TakeInput()
     if (g_Dialog != DialogNone)
     {
         PollHeldDirections();
+    PollTouchPad();
         TakeDialogInput();
         g_Actions = 0;
         g_MouseClicked = false;
@@ -1208,6 +1308,7 @@ void TakeInput()
     }
 
     PollHeldDirections();
+    PollTouchPad();
     // The mouse: hovering selects, a click picks (or steps a choice by its arrow, sets a slider, picks a tab), the wheel steps the
     // hovered value or scrolls, a right click goes back
     if (IsOn(OptionMouse) && (g_MouseMoved || g_MouseClicked || g_Wheel != 0 || g_MouseDown || g_MouseRightClicked))

@@ -11,6 +11,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <deque>
+#include <fstream>
 #include <list>
 
 namespace VkGl
@@ -260,14 +261,48 @@ void Free(Allocation& allocation)
     allocation = Allocation{};
 }
 
+// The GPU gave up on the device (a driver's fault): nothing more is done on it, and the next start draws with OpenGL
+// (vulkan_failed.txt in the settings folder: system.cpp reads it)
+void DeviceLost()
+{
+    if (g_Device.lost)
+    {
+        return;
+    }
+
+    g_Device.lost = true;
+    Log("the device was lost (the GPU's driver failed): OpenGL from the next start");
+    std::error_code ignored;
+    std::ofstream(Native::SettingsFolder() + "/vulkan_failed.txt") << "Vulkan's device was lost on this phone (VkGl): OpenGL is used\n";
+}
+
 u64 CompletedSerial()
 {
     std::lock_guard lock(g_PendingLock);
-    while (!g_Pending.empty() && vkGetFenceStatus(g_Device.device, g_Pending.front().fence) == VK_SUCCESS)
+    while (!g_Pending.empty())
     {
+        // (a failed submission's: no fence; a lost device's: every one counts as done, nothing will signal them)
+        VkFence fence = g_Pending.front().fence;
+        if (fence != VK_NULL_HANDLE && !g_Device.lost)
+        {
+            const VkResult status = vkGetFenceStatus(g_Device.device, fence);
+            if (status == VK_ERROR_DEVICE_LOST)
+            {
+                DeviceLost();
+            }
+            else if (status != VK_SUCCESS)
+            {
+                break;
+            }
+        }
+
         g_Device.completed = g_Pending.front().serial;
-        vkResetFences(g_Device.device, 1, &g_Pending.front().fence);
-        g_SpareFences.push_back(g_Pending.front().fence);
+        if (fence != VK_NULL_HANDLE)
+        {
+            vkResetFences(g_Device.device, 1, &fence);
+            g_SpareFences.push_back(fence);
+        }
+
         g_Pending.pop_front();
     }
 
@@ -301,13 +336,17 @@ void WaitSerial(u64 serial)
             }
         }
 
-        if (fence == VK_NULL_HANDLE)
+        if (fence == VK_NULL_HANDLE || g_Device.lost)
         {
             CompletedSerial();
             return;
         }
 
-        vkWaitForFences(g_Device.device, 1, &fence, VK_TRUE, ~0ull);
+        if (vkWaitForFences(g_Device.device, 1, &fence, VK_TRUE, ~0ull) == VK_ERROR_DEVICE_LOST)
+        {
+            DeviceLost();
+        }
+
         CompletedSerial();
     }
 }
@@ -379,13 +418,35 @@ u64 SubmitToQueue(VkCommandBuffer commands, VkSemaphore wait, VkPipelineStageFla
 
     std::lock_guard queue(g_Device.queueLock);
     VkResult result = vkQueueSubmit(g_Device.queue, 1, &submit, fence);
-    if (result != VK_SUCCESS)
-    {
-        Log("vkQueueSubmit: %s", ResultName(result));
-    }
-
     const u64 serial = ++g_Device.submitted;
     std::lock_guard lock(g_PendingLock);
+    if (result != VK_SUCCESS)
+    {
+        // (nothing will signal the fence: the submission counts as done, its work lost)
+        static u32 told = 0;
+        if (told++ < 5)
+        {
+            Log("vkQueueSubmit: %s", ResultName(result));
+        }
+
+        g_SpareFences.push_back(fence);
+        if (result == VK_ERROR_DEVICE_LOST)
+        {
+            DeviceLost();
+        }
+
+        if (g_Pending.empty())
+        {
+            g_Device.completed = serial;
+        }
+        else
+        {
+            g_Pending.push_back({serial, VK_NULL_HANDLE});
+        }
+
+        return serial;
+    }
+
     g_Pending.push_back({serial, fence});
     return serial;
 }
@@ -662,16 +723,16 @@ bool Supported()
         vkEnumerateInstanceVersion(&loaderVersion);
     }
 
-    if (loaderVersion < VK_API_VERSION_1_3)
+    if (loaderVersion < VK_API_VERSION_1_1)
     {
-        Log("not used: the loader has Vulkan %u.%u, 1.3 is needed", VK_API_VERSION_MAJOR(loaderVersion), VK_API_VERSION_MINOR(loaderVersion));
+        Log("not used: the loader has Vulkan %u.%u, 1.1 is needed", VK_API_VERSION_MAJOR(loaderVersion), VK_API_VERSION_MINOR(loaderVersion));
         return false;
     }
 
-    // An instance of its own, the devices asked for Vulkan 1.3 and dynamic rendering, gone again
+    // An instance of its own, the devices asked for Vulkan 1.1 (1.3 with dynamic rendering: the fewer passes' path), gone again
     VkApplicationInfo application = {};
     application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    application.apiVersion = VK_API_VERSION_1_3;
+    application.apiVersion = loaderVersion >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
     VkInstanceCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     info.pApplicationInfo = &application;
@@ -684,10 +745,9 @@ bool Supported()
 
     auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(g_GetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices"));
     auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(g_GetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties"));
-    auto features = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(g_GetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
     auto destroy = reinterpret_cast<PFN_vkDestroyInstance>(g_GetInstanceProcAddr(instance, "vkDestroyInstance"));
     bool found = false;
-    if (enumerate != nullptr && properties != nullptr && features != nullptr)
+    if (enumerate != nullptr && properties != nullptr)
     {
         u32 count = 0;
         enumerate(instance, &count, nullptr);
@@ -697,25 +757,14 @@ bool Supported()
         {
             VkPhysicalDeviceProperties p;
             properties(physical, &p);
-            VkPhysicalDeviceVulkan13Features has13 = {};
-            has13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-            VkPhysicalDeviceFeatures2 has = {};
-            has.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            if (p.apiVersion >= VK_API_VERSION_1_3)
-            {
-                has.pNext = &has13;
-                features(physical, &has);
-            }
-
-            if (p.apiVersion >= VK_API_VERSION_1_3 && has13.dynamicRendering)
+            if (p.apiVersion >= VK_API_VERSION_1_1)
             {
                 found = true;
             }
             else
             {
-                Log("not used on %s: its driver has Vulkan %u.%u%s (1.3 with dynamic rendering is needed)", p.deviceName,
-                    VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
-                    p.apiVersion >= VK_API_VERSION_1_3 ? " without dynamic rendering" : "");
+                Log("not used on %s: its driver has Vulkan %u.%u (1.1 is needed)", p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion),
+                    VK_API_VERSION_MINOR(p.apiVersion));
             }
         }
     }
@@ -760,9 +809,17 @@ bool StartOn(SDL_Window* window)
         vkEnumerateInstanceVersion(&loaderVersion);
     }
 
-    if (loaderVersion < VK_API_VERSION_1_3)
+    // ($TWIN_VULKAN_API=1.1: as a Vulkan 1.1 driver, to test that path with the validation layer)
+    const char* forcedApi = std::getenv("TWIN_VULKAN_API");
+    const bool as11 = forcedApi != nullptr && std::strcmp(forcedApi, "1.1") == 0;
+    if (as11)
     {
-        Log("the loader has Vulkan %u.%u: 1.3 is needed", VK_API_VERSION_MAJOR(loaderVersion), VK_API_VERSION_MINOR(loaderVersion));
+        loaderVersion = std::min<u32>(loaderVersion, VK_API_VERSION_1_1);
+    }
+
+    if (loaderVersion < VK_API_VERSION_1_1)
+    {
+        Log("the loader has Vulkan %u.%u: 1.1 is needed", VK_API_VERSION_MAJOR(loaderVersion), VK_API_VERSION_MINOR(loaderVersion));
         return false;
     }
 
@@ -784,7 +841,7 @@ bool StartOn(SDL_Window* window)
     application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     application.pApplicationName = "Crash Twinsanity";
     application.pEngineName = "twinsanity-vkgl";
-    application.apiVersion = VK_API_VERSION_1_3;
+    application.apiVersion = loaderVersion >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
     VkInstanceCreateInfo instanceInfo = {};
     instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instanceInfo.pApplicationInfo = &application;
@@ -837,7 +894,7 @@ bool StartOn(SDL_Window* window)
 
         VkPhysicalDeviceProperties properties;
         vkGetPhysicalDeviceProperties(devices[i], &properties);
-        if (properties.apiVersion < VK_API_VERSION_1_3)
+        if (properties.apiVersion < VK_API_VERSION_1_1)
         {
             continue;
         }
@@ -874,27 +931,37 @@ bool StartOn(SDL_Window* window)
 
     if (d.physical == VK_NULL_HANDLE)
     {
-        Log("no Vulkan 1.3 device with a queue that draws%s", s.surface != VK_NULL_HANDLE ? " and presents" : "");
+        Log("no Vulkan 1.1 device with a queue that draws%s", s.surface != VK_NULL_HANDLE ? " and presents" : "");
         return false;
     }
 
     vkGetPhysicalDeviceMemoryProperties(d.physical, &d.memory);
     VkPhysicalDeviceFeatures has = {};
     vkGetPhysicalDeviceFeatures(d.physical, &has);
+    // Vulkan 1.3 with dynamic rendering: rendering instances begun by their attachments, the depth and stencil state dynamic. Else
+    // (Vulkan 1.1, 1.2: an older driver, the Poco F5's Adreno 725) render pass objects, framebuffers, the state in the pipelines
+    // ($TWIN_VULKAN_RENDER_PASSES=1: that path anywhere, to test it)
+    const bool is13 = d.properties.apiVersion >= VK_API_VERSION_1_3 && !as11;
     VkPhysicalDeviceVulkan13Features has13 = {};
     has13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    VkPhysicalDeviceHostQueryResetFeatures hasReset = {};
+    hasReset.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES;
+    const bool resetExtension = !is13 && HasDeviceExtension(d.physical, VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
     VkPhysicalDeviceFeatures2 has2 = {};
     has2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    VkPhysicalDeviceVulkan12Features has12 = {};
-    has12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    has13.pNext = &has12;
-    has2.pNext = &has13;
-    vkGetPhysicalDeviceFeatures2(d.physical, &has2);
-    if (!has13.dynamicRendering)
+    if (is13)
     {
-        Log("the device has no dynamic rendering");
-        return false;
+        has13.pNext = &hasReset;
+        has2.pNext = &has13;
     }
+    else if (resetExtension)
+    {
+        has2.pNext = &hasReset;
+    }
+
+    vkGetPhysicalDeviceFeatures2(d.physical, &has2);
+    const char* forcedPasses = std::getenv("TWIN_VULKAN_RENDER_PASSES");
+    d.renderPasses = !is13 || !has13.dynamicRendering || (forcedPasses != nullptr && forcedPasses[0] == '1');
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queue = {};
@@ -904,14 +971,22 @@ bool StartOn(SDL_Window* window)
     queue.pQueuePriorities = &priority;
     VkPhysicalDeviceVulkan13Features want13 = {};
     want13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-    want13.dynamicRendering = VK_TRUE;
-    VkPhysicalDeviceVulkan12Features want12 = {};
-    want12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    want12.hostQueryReset = has12.hostQueryReset;
-    want13.pNext = &want12;
+    want13.dynamicRendering = has13.dynamicRendering;
+    VkPhysicalDeviceHostQueryResetFeatures wantReset = {};
+    wantReset.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES;
+    wantReset.hostQueryReset = hasReset.hostQueryReset;
     VkPhysicalDeviceFeatures2 want = {};
     want.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    want.pNext = &want13;
+    if (is13)
+    {
+        want13.pNext = &wantReset;
+        want.pNext = &want13;
+    }
+    else if (resetExtension)
+    {
+        want.pNext = &wantReset;
+    }
+
     want.features.dualSrcBlend = has.dualSrcBlend;
     want.features.samplerAnisotropy = has.samplerAnisotropy;
     want.features.wideLines = has.wideLines;
@@ -929,6 +1004,11 @@ bool StartOn(SDL_Window* window)
         extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     }
 
+    if (resetExtension)
+    {
+        extensions.push_back(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
+    }
+
     VkDeviceCreateInfo deviceInfo = {};
     deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     deviceInfo.pNext = &want;
@@ -943,15 +1023,15 @@ bool StartOn(SDL_Window* window)
         return false;
     }
 
-#define VKGL_LOAD_DEVICE(name)                                                                                                 \
-    name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(d.device, #name));                                                 \
-    if (name == nullptr)                                                                                                       \
-    {                                                                                                                          \
-        Log("the device has no %s", #name);                                                                                    \
-    }
+#define VKGL_LOAD_DEVICE(name) name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(d.device, #name));
     VKGL_DEVICE(VKGL_LOAD_DEVICE)
 #undef VKGL_LOAD_DEVICE
-    if (!has12.hostQueryReset)
+    if (!is13 && resetExtension)
+    {
+        vkResetQueryPool = reinterpret_cast<PFN_vkResetQueryPool>(vkGetDeviceProcAddr(d.device, "vkResetQueryPoolEXT"));
+    }
+
+    if (!hasReset.hostQueryReset)
     {
         vkResetQueryPool = nullptr;
     }
@@ -961,7 +1041,8 @@ bool StartOn(SDL_Window* window)
     d.anisotropy = has.samplerAnisotropy != 0;
     d.maxAnisotropy = d.properties.limits.maxSamplerAnisotropy;
     d.wideLines = has.wideLines != 0;
-    d.timestamps = d.properties.limits.timestampComputeAndGraphics != 0;
+    // (not with render pass objects: an old driver's timestamps and host resets aren't trusted, and they're only the statistics')
+    d.timestamps = d.properties.limits.timestampComputeAndGraphics != 0 && !d.renderPasses;
     d.timestampPeriod = d.properties.limits.timestampPeriod;
     VkPipelineCacheCreateInfo cacheInfo = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, 0, nullptr};
     vkCreatePipelineCache(d.device, &cacheInfo, nullptr, &d.pipelineCache);
@@ -975,10 +1056,10 @@ bool StartOn(SDL_Window* window)
     }
 
     g_Started = true;
-    Log("OpenGL in Vulkan on %s (Vulkan %u.%u.%u, driver 0x%x): dual-source blend %s, anisotropy %s", d.properties.deviceName,
+    Log("OpenGL in Vulkan on %s (Vulkan %u.%u.%u, driver 0x%x): %s, dual-source blend %s, anisotropy %s", d.properties.deviceName,
         VK_API_VERSION_MAJOR(d.properties.apiVersion), VK_API_VERSION_MINOR(d.properties.apiVersion),
-        VK_API_VERSION_PATCH(d.properties.apiVersion), d.properties.driverVersion, d.dualSource ? "yes" : "no",
-        d.anisotropy ? "yes" : "no");
+        VK_API_VERSION_PATCH(d.properties.apiVersion), d.properties.driverVersion,
+        d.renderPasses ? "render pass objects" : "dynamic rendering", d.dualSource ? "yes" : "no", d.anisotropy ? "yes" : "no");
     return true;
 }
 }
