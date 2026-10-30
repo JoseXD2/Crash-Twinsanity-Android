@@ -33,6 +33,10 @@ SDL_VERSION = "3.4.18"
 SDL_URL = f"https://github.com/libsdl-org/SDL/releases/download/release-{SDL_VERSION}/SDL3-{SDL_VERSION}.tar.gz"
 SDL_SHA256 = "9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3"
 FFMPEG_VERSION = "9.0.2"
+# VkGl's shader compiler (src/platform/native/graphics/vk/vkglprogram.cpp): glslang, static, without its optimizer or HLSL
+GLSLANG_VERSION = "15.1.0"
+GLSLANG_URL = f"https://github.com/KhronosGroup/glslang/archive/refs/tags/{GLSLANG_VERSION}.tar.gz"
+GLSLANG_SHA256 = "4bdcd8cdb330313f0d4deed7be527b0ac1c115ff272e492853a6e98add61b4bc"
 PACKAGE = "org.twinsanity.native"
 
 
@@ -106,6 +110,25 @@ def own_sdl(ndk, cmake, ninja, source):
     return prefix
 
 
+def own_glslang(ndk, cmake, ninja):
+    prefix = DEPS / f"glslang-{GLSLANG_VERSION}-android"
+    if (prefix / "lib" / "cmake" / "glslang" / "glslang-config.cmake").exists():
+        return prefix
+    archive = DEPS / f"glslang-{GLSLANG_VERSION}.tar.gz"
+    download(GLSLANG_URL, archive, GLSLANG_SHA256)
+    source = DEPS / f"glslang-{GLSLANG_VERSION}"
+    if not source.exists():
+        with tarfile.open(archive) as tar:
+            tar.extractall(DEPS, filter="data")
+    build = DEPS / f"glslang-{GLSLANG_VERSION}-android-build"
+    run([cmake, "-S", source, "-B", build, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"] + ndk.cmake_flags() +
+        [f"-DCMAKE_INSTALL_PREFIX={prefix}", "-DCMAKE_INSTALL_LIBDIR=lib", "-DBUILD_SHARED_LIBS=OFF", "-DENABLE_OPT=OFF",
+         "-DBUILD_EXTERNAL=OFF", "-DGLSLANG_TESTS=OFF", "-DENABLE_GLSLANG_BINARIES=OFF", "-DENABLE_SPVREMAPPER=OFF",
+         "-DENABLE_HLSL=OFF", "-DENABLE_PCH=OFF", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON", "-DGLSLANG_ENABLE_INSTALL=ON"])
+    run([cmake, "--build", build, "--target", "install"])
+    return prefix
+
+
 def own_ffmpeg(ndk, args):
     """The decode-only LGPL FFmpeg (native/tools/build_ffmpeg.sh's configuration) cross-compiled for Android into
     build/native/ffmpeg/android-arm64, where native/CMakeLists.txt looks"""
@@ -132,13 +155,14 @@ def own_ffmpeg(ndk, args):
     return prefix
 
 
-def build_game(ndk, cmake, ninja, sdl, args):
+def build_game(ndk, cmake, ninja, sdl, glslang, args):
     build = OUT / "cmake"
     if args.clean and build.exists():
         shutil.rmtree(build)
     if args.configure or not (build / "build.ninja").exists():
         run([cmake, "-S", HERE / "native", "-B", build, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"] + ndk.cmake_flags() +
-            [f"-DCMAKE_PREFIX_PATH={sdl}", f"-DCMAKE_FIND_ROOT_PATH={sdl};{HERE / 'build' / 'native' / 'ffmpeg' / 'android-arm64'}",
+            [f"-DCMAKE_PREFIX_PATH={sdl};{glslang}",
+             f"-DCMAKE_FIND_ROOT_PATH={sdl};{glslang};{HERE / 'build' / 'native' / 'ffmpeg' / 'android-arm64'}",
              f"-DTWIN_TOOL_CLANG={ndk.clangxx}", f"-DPython3_EXECUTABLE={sys.executable}",
              "-DTWIN_GLES=ON", f"-DPKG_CONFIG_EXECUTABLE={find_tool('pkg-config', 'apt install pkg-config')}"])
     run([cmake, "--build", build, "--"] + args.ninja)
@@ -254,7 +278,8 @@ def main():
     source = sdl_source(args)
     sdl = own_sdl(ndk, cmake, ninja, source)
     ffmpeg = own_ffmpeg(ndk, args)
-    lib = build_game(ndk, cmake, ninja, sdl, args)
+    glslang = own_glslang(ndk, cmake, ninja)
+    lib = build_game(ndk, cmake, ninja, sdl, glslang, args)
     if not args.no_package:
         package(ndk, sdl, source, ffmpeg, lib, args)
 

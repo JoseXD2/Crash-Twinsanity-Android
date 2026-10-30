@@ -120,7 +120,7 @@ struct Gl
 
 template <typename T> void Load(T& function, const char* name)
 {
-    function = reinterpret_cast<T>(SDL_GL_GetProcAddress(name));
+    function = reinterpret_cast<T>(NativeGl::GetProcAddress(name));
 }
 
 bool LoadGl(Gl& gl)
@@ -444,7 +444,7 @@ GLuint Compile(Gl& gl, GLenum kind, const char* given)
 
 bool Prepare(Renderer& r)
 {
-    SDL_GLContext context = SDL_GL_GetCurrentContext();
+    SDL_GLContext context = NativeGl::CurrentContext();
     if (r.ready && r.context == context)
     {
         return true;
@@ -881,14 +881,14 @@ bool RenderFrameOffscreen(u32 width, u32 height, std::vector<u32>* pixels)
         }
 
         NativeGl::SetContextAttributes();
-        window = SDL_CreateWindow("overlay", 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+        window = SDL_CreateWindow("overlay", 64, 64, NativeGl::WindowFlag() | SDL_WINDOW_HIDDEN);
         if (window == nullptr)
         {
             Native::Log("overlay: no hidden window for the shots: %s", SDL_GetError());
             return false;
         }
 
-        context = SDL_GL_CreateContext(window);
+        context = NativeGl::CreateContext(window);
         if (context == nullptr)
         {
             Native::Log("overlay: no GL context for the shots: %s", SDL_GetError());
@@ -896,7 +896,7 @@ bool RenderFrameOffscreen(u32 width, u32 height, std::vector<u32>* pixels)
         }
     }
 
-    SDL_GL_MakeCurrent(window, context);
+    NativeGl::MakeCurrentOn(window, context);
     if (!Prepare(g_Renderer))
     {
         return false;

@@ -4,6 +4,7 @@
 // touches (SDL's mouse events made from them), the mouse, the keyboard (arrows, Enter, Escape) and the pads (the D-pad, south to
 // pick, east or back to quit)
 #include "ui/launcher.h"
+#include "graphics/glcompat.h"
 #include "ui/overlayinternal.h"
 #include "ui/pctext.h"
 #include "ui/nativeui.h"
@@ -477,7 +478,7 @@ bool RunLauncher(SDL_Window* window, const std::string& image, const std::functi
                  const std::function<std::string()>& pick, std::string* chosen)
 {
     g_Language = LanguageIndex();
-    SDL_GLContext context = SDL_GL_CreateContext(window);
+    SDL_GLContext context = NativeGl::CreateContext(window);
     if (context == nullptr)
     {
         // No screen of its own: the system's file picker straight away, as without the launcher
@@ -499,11 +500,11 @@ bool RunLauncher(SDL_Window* window, const std::string& image, const std::functi
         }
     }
 
-    SDL_GL_MakeCurrent(window, context);
-    SDL_GL_SetSwapInterval(1);
-    auto clearColour = reinterpret_cast<GlClearColor>(SDL_GL_GetProcAddress("glClearColor"));
-    auto clear = reinterpret_cast<GlClear>(SDL_GL_GetProcAddress("glClear"));
-    auto viewport = reinterpret_cast<GlViewport>(SDL_GL_GetProcAddress("glViewport"));
+    NativeGl::MakeCurrentOn(window, context);
+    NativeGl::SetSwapInterval(1);
+    auto clearColour = reinterpret_cast<GlClearColor>(NativeGl::GetProcAddress("glClearColor"));
+    auto clear = reinterpret_cast<GlClear>(NativeGl::GetProcAddress("glClear"));
+    auto viewport = reinterpret_cast<GlViewport>(NativeGl::GetProcAddress("glViewport"));
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
     std::vector<SDL_Gamepad*> pads;
 
@@ -680,7 +681,7 @@ bool RunLauncher(SDL_Window* window, const std::string& image, const std::functi
         }
 
         DrawOverlayCommands(frame.Commands(), pixelWidth, pixelHeight);
-        SDL_GL_SwapWindow(window);
+        NativeGl::SwapWindow(window);
     }
 
     // The screen's context gone before the graphics make theirs (the overlay's renderer made again in theirs)
@@ -690,8 +691,8 @@ bool RunLauncher(SDL_Window* window, const std::string& image, const std::functi
         SDL_CloseGamepad(pad);
     }
 
-    SDL_GL_MakeCurrent(window, nullptr);
-    SDL_GL_DestroyContext(context);
+    NativeGl::MakeCurrentOn(window, nullptr);
+    NativeGl::DestroyGlContext(context);
     ForgetOverlayRenderer();
     Native::Log("launcher: %s", play ? "play" : "quit");
     if (play)

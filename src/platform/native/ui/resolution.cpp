@@ -259,6 +259,13 @@ bool ChoicesChanged(s32 scaleChoice, s32 displayChoice)
     return true;
 }
 
+void PresetResolution(const Resolution& resolution)
+{
+    Save(resolution);
+    g_Current = resolution;
+    g_Known = true;
+}
+
 void ApplySavedResolution()
 {
     Resolution saved;

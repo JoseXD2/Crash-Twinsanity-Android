@@ -17,11 +17,34 @@
 
 namespace NativeGl
 {
+// Whether this run's GL is VkGl (vk/vkgl.h: OpenGL 3.3 core's meanings carried out with Vulkan): chosen before the window is made
+// (UseVulkan), kept when VkGl starts on the window (StartVulkan), else the system's GL. Only with TWIN_VULKAN builds
+bool Vulkan();
+void UseVulkan(bool on);
+// The window made for it (SDL_WINDOW_VULKAN, else SDL_WINDOW_OPENGL) and the device made on it; false: the system's GL from then
+// (the window made again with SDL_WINDOW_OPENGL by the caller)
+SDL_WindowFlags WindowFlag();
+bool StartVulkan(SDL_Window* window);
+
+// Whether the GL is OpenGL ES 3.0 (the build's, TWIN_GLES), not with VkGl (its GLSL is 330 core's)
 #if defined(TWIN_GLES)
-constexpr bool Es = true;
+inline bool EsBuild = true;
 #else
-constexpr bool Es = false;
+inline bool EsBuild = false;
 #endif
+inline bool IsEs()
+{
+    return EsBuild && !Vulkan();
+}
+
+// The SDL_GL_ calls the GL users make, VkGl's with it
+SDL_FunctionPointer GetProcAddress(const char* name);
+SDL_GLContext CreateContext(SDL_Window* window);
+bool MakeCurrentOn(SDL_Window* window, SDL_GLContext context);
+SDL_GLContext CurrentContext();
+void DestroyGlContext(SDL_GLContext context);
+void SwapWindow(SDL_Window* window);
+void SetSwapInterval(int interval);
 
 // The GL attributes for the next context (SDL_GL_SetAttribute): 3.3 core, or ES 3.0
 void SetContextAttributes();
@@ -40,6 +63,10 @@ bool DualSourceBlend();
 // ES: whether the fragment shader can read the framebuffer's pixel (GL_EXT_shader_framebuffer_fetch): the renderer's shader
 // blend then reads the destination there, with no copy of the target before each batch (GL 3.3: never)
 bool FramebufferFetch();
+// Whether the hardware renderer's shader blend (and its destination alpha test) reads the framebuffer rather than a copy of the
+// target: with the fetch and no dual-source blend (Mali's own driver), and on Adreno's own driver with both (its fetch reads the
+// tile in place, where each copy of a target costs the tile's store and load: the Poco F5's gems); not on ANGLE (drew wrong)
+bool ShaderBlendByFetch();
 
 // An offscreen context: a hidden window's, or on Android the window's with no surface
 struct Context

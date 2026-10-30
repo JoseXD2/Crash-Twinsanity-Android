@@ -257,6 +257,14 @@ enum NativeText : u32
     TextLauncherQuit,
     TextLauncherHint,
     TextLauncherReady,
+    // The renderer (settings.cpp's display page, with TWIN_VULKAN): OpenGL or Vulkan, from the next start
+    TextRenderer,
+    TextDescRenderer,
+    TextOpenGl,
+    TextVulkan,
+    // The automatic settings (settings.cpp's display page, autoconfig.cpp)
+    TextAutoConfig,
+    TextDescAutoConfig,
     NativeTextEnd,
 };
 
@@ -311,6 +319,8 @@ extern bool g_ResolutionToGraphics;
 // while the page is shown isn't snapped to a choice's size
 void NoteChoices(s32 scaleChoice, s32 displayChoice);
 bool ChoicesChanged(s32 scaleChoice, s32 displayChoice);
+// A resolution saved before the graphics start (the automatic settings' at a first start): applied by ApplySavedResolution
+void PresetResolution(const Resolution& resolution);
 // At start-up, once the window is there: the saved resolution applied, else the defaults (which aren't written: the file is made
 // by the player's own choice)
 void ApplySavedResolution();
@@ -393,6 +403,9 @@ enum Option : u32
     OptionTouchControls,
     OptionTouchSize,
     OptionTouchOpacity,
+    // The renderer the graphics draw with: OpenGL (0: the system's, ANGLE's on Android) or Vulkan (1: VkGl, vk/vkgl.h), taken at
+    // the start (the window is made for it); OpenGL when Vulkan doesn't start
+    OptionRenderer,
     OptionCount,
 };
 
@@ -417,6 +430,15 @@ void LogOptions();
 void LogResolution();
 // Sets an option (kept, and applied at once where it applies at once)
 void SetOption(Option option, s32 value);
+// Sets and keeps an option without applying it (before the game and the graphics start: they take it then), and whether
+// options.txt was there when the options were read (else a first start)
+void PresetOption(Option option, s32 value);
+bool OptionsSaved();
+// The automatic settings (autoconfig.cpp): the render scale, the renderer and the costly filters chosen for this device's GPU,
+// memory and cores. At the first start on a phone (no options.txt yet), before the window is made; and from the Display page
+// (live: the scale applied at once, the renderer at the next start). What was chosen and why goes to the log
+void AutoConfigureFirstStart();
+void AutoConfigure(bool live);
 // Applies what an option changes once it's set, and every option's start-up effect (features.cpp)
 void ApplyOption(Option option);
 void ApplyStartOptions();

@@ -253,6 +253,13 @@ void Build()
     display.push_back(OptionChoice(TextAntiAliasing, TextDescAntiAliasing, OptionAntiAliasing, {0, TextFxaa}));
     display.push_back(Toggle(TextVSync, TextDescVSync, OptionVSync));
     display.push_back(Toggle(TextShowFps, TextDescShowFps, OptionShowFps));
+#if defined(TWIN_VULKAN)
+    // (taken at the next start: the window is made for the renderer)
+    display.push_back(OptionChoice(TextRenderer, TextDescRenderer, OptionRenderer, {TextOpenGl, TextVulkan}));
+#endif
+    Row automatic = Action(TextAutoConfig, TextDescAutoConfig, [] { AutoConfigure(true); });
+    automatic.shown = [] { return Native::IsMobile(); };
+    display.push_back(automatic);
     Row centre = Action(GameTextCentreScreen, TextDescScreenPosition, [] { OpenScreenPosition(); });
     centre.shown = [] { return !Native::IsMobile(); };
     display.push_back(centre);

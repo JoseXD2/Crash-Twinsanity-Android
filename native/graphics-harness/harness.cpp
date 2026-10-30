@@ -40,6 +40,7 @@
 #include "graphics/gs/backend.h"
 #include "graphics/hw/hwgs.h"
 #include "graphics/settings.h"
+#include "graphics/glcompat.h"
 #include "graphics/glyphs.h"
 #include <cmath>
 #include <vector>
@@ -222,6 +223,17 @@ int main(int argc, char** argv)
     }
 
     NativeGraphics::SetRenderThreadWanted(renderThread);
+    // $TWIN_RENDERER=vulkan: the hardware renderer's GL is VkGl (offscreen: no window, no swapchain)
+    if (const char* renderer = std::getenv("TWIN_RENDERER"); renderer != nullptr && std::strcmp(renderer, "vulkan") == 0)
+    {
+        SDL_InitSubSystem(SDL_INIT_VIDEO);
+        NativeGl::UseVulkan(true);
+        if (!NativeGl::StartVulkan(nullptr))
+        {
+            std::fprintf(stderr, "graphics-harness: no Vulkan renderer\n");
+            return 1;
+        }
+    }
 
     // A recording (TWIN_CAPTURE) played back: its pictures as replayNNN.png (--bench: only the times)
     if (!replay.empty())

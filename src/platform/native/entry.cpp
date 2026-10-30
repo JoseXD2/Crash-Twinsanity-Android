@@ -20,6 +20,9 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #endif
 
 #include <cstdlib>
@@ -208,7 +211,11 @@ void SetUpLog()
 #if defined(__ANDROID__)
 namespace
 {
-// Android shows nothing of stdout and stderr: both go through a pipe to logcat (tag "twinsanity"), a line at a time
+// Android shows nothing of stdout and stderr: both go through a pipe to logcat (tag "twinsanity"), a line at a time, and to
+// log.txt in the game's folder (the last run's kept as log.previous.txt), so a player without adb can send it. The drops: when a
+// frame statistics line (display.cpp: every 60 pictures) says under 54 frames a second, drops.txt gets the moment: the run's
+// first lines (the device, the GPU, the renderer, the options) once, then for each drop the lines before it (the frames, the
+// passes, the profile's windows), at most one a 5 s and 200 in a run
 void StartLogcat()
 {
     static int fds[2];
@@ -221,8 +228,94 @@ void StartLogcat()
     dup2(fds[1], 2);
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
-    std::thread([]
+    const std::string folder = Native::SettingsFolder();
+    std::thread([folder]
     {
+        std::error_code ignored;
+        std::filesystem::create_directories(folder, ignored);
+        std::filesystem::rename(folder + "/log.txt", folder + "/log.previous.txt", ignored);
+        std::filesystem::rename(folder + "/drops.txt", folder + "/drops.previous.txt", ignored);
+        FILE* log = std::fopen((folder + "/log.txt").c_str(), "w");
+        FILE* drops = nullptr;
+        size_t logBytes = 0;
+        constexpr size_t LogLimit = 64u * 1024 * 1024;
+        std::vector<std::string> first;
+        std::vector<std::string> recent;
+        constexpr size_t RecentLines = 400;
+        size_t recentAt = 0;
+        u32 dropCount = 0;
+        auto lastDrop = std::chrono::steady_clock::time_point{};
+        auto onLine = [&](const std::string& line)
+        {
+            __android_log_write(ANDROID_LOG_INFO, "twinsanity", line.c_str());
+            if (log != nullptr && logBytes < LogLimit)
+            {
+                std::fputs(line.c_str(), log);
+                std::fputc('\n', log);
+                std::fflush(log);
+                logBytes += line.size() + 1;
+            }
+
+            if (first.size() < 120)
+            {
+                first.push_back(line);
+            }
+
+            if (recent.size() < RecentLines)
+            {
+                recent.push_back(line);
+            }
+            else
+            {
+                recent[recentAt] = line;
+                recentAt = (recentAt + 1) % RecentLines;
+            }
+
+            // A frame statistics line: its 60 pictures' time
+            const size_t at = line.rfind("frame: ", 0) == 0 ? 0 : line.find("] frame: ");
+            if (at == std::string::npos)
+            {
+                return;
+            }
+
+            const double ms = std::atof(line.c_str() + line.find("frame: ") + 7);
+            const double fps = ms > 0.0 ? 60000.0 / ms : 0.0;
+            const auto now = std::chrono::steady_clock::now();
+            if (fps <= 1.0 || fps >= 54.0 || dropCount >= 200 || now - lastDrop < std::chrono::seconds(5))
+            {
+                return;
+            }
+
+            lastDrop = now;
+            dropCount++;
+            if (drops == nullptr)
+            {
+                drops = std::fopen((folder + "/drops.txt").c_str(), "w");
+                if (drops == nullptr)
+                {
+                    return;
+                }
+
+                std::fputs("# The run's first lines (the device, the renderer, the options)\n", drops);
+                for (const std::string& kept : first)
+                {
+                    std::fprintf(drops, "%s\n", kept.c_str());
+                }
+            }
+
+            const double seconds = SDL_GetTicks() / 1000.0;
+            std::fprintf(drops, "\n# Drop %u at %.1f s: %.1f frames a second; the lines before it\n", dropCount, seconds, fps);
+            // (the last 120 lines: a few seconds of statistics, the passes, a profile window when one ended then)
+            const size_t count = std::min<size_t>(recent.size(), 120);
+            for (size_t i = recent.size() - count; i < recent.size(); i++)
+            {
+                const size_t index = recent.size() < RecentLines ? i : (recentAt + i) % RecentLines;
+                std::fprintf(drops, "%s\n", recent[index].c_str());
+            }
+
+            std::fflush(drops);
+        };
+
         std::string line;
         char buffer[512];
         for (;;)
@@ -237,7 +330,7 @@ void StartLogcat()
             {
                 if (buffer[i] == '\n')
                 {
-                    __android_log_write(ANDROID_LOG_INFO, "twinsanity", line.c_str());
+                    onLine(line);
                     line.clear();
                 }
                 else

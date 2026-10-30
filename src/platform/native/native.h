@@ -104,6 +104,9 @@ double SessionSeconds();
 // frequencies; elsewhere nothing). The game's, VU1's and the render thread: a phone's scheduler otherwise leaves them on its
 // small cores
 void PinToFastCores(const char* name, bool busiest = false);
+// The pinned threads checked again (the frame statistics' every 5 s on Android): a refused affinity tried again, and where each
+// thread ran last, the process's cpuset and the cores it may use, to the log (a phone whose cpuset leaves the game the small cores)
+void CheckThreads();
 // Whether this is a phone or tablet (Android): the window is the screen, the controls are touched
 bool IsMobile();
 // The sampling profiler (profiler_posix.cpp, $TWIN_PROFILE): the threads it samples register themselves (PinToFastCores does)

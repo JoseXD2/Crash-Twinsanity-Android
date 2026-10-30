@@ -1,4 +1,5 @@
 #include "capture.h"
+#include "native.h"
 
 #include "hardware.h"
 #include "renderthread.h"
@@ -9,6 +10,7 @@
 #include "gs/backend.h"
 #include "gs/gs.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -135,6 +137,28 @@ void CaptureShown()
         }
     }
 
+    // capture_now.txt in the settings folder (written while playing: adb shell touch, a file manager) records the frames from the
+    // next one into capture.bin beside it, as many as the file says (3 when it's empty); it's removed once it's seen. Not in the
+    // first ten seconds (a file left from before would record the start-up's black frames)
+    if (c.path.empty() && c.file == nullptr && c.shown % 30 == 0 && c.shown >= 600)
+    {
+        const std::string trigger = Native::SettingsFolder() + "/capture_now.txt";
+        if (FILE* file = std::fopen(trigger.c_str(), "rb"))
+        {
+            int count = 0;
+            if (std::fscanf(file, "%d", &count) != 1 || count <= 0)
+            {
+                count = 3;
+            }
+
+            std::fclose(file);
+            std::remove(trigger.c_str());
+            c.path = Native::SettingsFolder() + "/capture.bin";
+            c.first = c.shown;
+            c.count = static_cast<u32>(std::min(count, 600));
+        }
+    }
+
     if (c.path.empty())
     {
         return;
@@ -169,6 +193,19 @@ void CaptureShown()
         else
         {
             std::fwrite(Magic, sizeof(Magic), 1, c.file);
+            // Local memory made current first: the hardware renderer keeps the pages it drew on the GPU (the recording's state is
+            // local memory's)
+            Gs::Gs& gs = *GetHardware().gs;
+            if (gs.backend() != nullptr)
+            {
+                Gs::PageSet all;
+                all.set();
+                RenderCallAndWait([&] {
+                    gs.backend()->cpuReason = "capture";
+                    gs.backend()->BeforeCpuRead(all);
+                });
+            }
+
             std::vector<u8> state;
             StateWriter writer(state);
             Saver saver{writer};

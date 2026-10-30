@@ -659,6 +659,12 @@ const NativeTextLine g_NativeTexts[] = {
     {TextLauncherQuit, {"quit", "quitter", "beenden", "salir", "esci"}},
     {TextLauncherHint, {"your own copy of the pal disc (sles-52568), as .iso, .bin or .img.", "ta copie du disque pal (sles-52568), en .iso, .bin ou .img.", "deine eigene pal-disc (sles-52568) als .iso, .bin oder .img.", "tu copia del disco pal (sles-52568), en .iso, .bin o .img.", "la tua copia del disco pal (sles-52568), come .iso, .bin o .img."}},
     {TextLauncherReady, {"ready to play.", "prêt à jouer.", "bereit zum spielen.", "listo para jugar.", "pronto per giocare."}},
+    {TextRenderer, {"renderer", "rendu", "renderer", "renderizador", "renderer"}},
+    {TextDescRenderer, {"what draws the game. vulkan can be faster on phones. it changes at the next start.", "ce qui dessine le jeu. vulkan peut être plus rapide sur téléphone. change au prochain lancement.", "was das spiel zeichnet. vulkan kann auf handys schneller sein. gilt ab dem nächsten start.", "lo que dibuja el juego. vulkan puede ir más rápido en móviles. cambia al próximo inicio.", "ciò che disegna il gioco. vulkan può essere più veloce sui telefoni. cambia al prossimo avvio."}},
+    {TextOpenGl, {"opengl", "opengl", "opengl", "opengl", "opengl"}},
+    {TextVulkan, {"vulkan", "vulkan", "vulkan", "vulkan", "vulkan"}},
+    {TextAutoConfig, {"best settings for this device", "meilleurs réglages pour cet appareil", "beste einstellungen für dieses gerät", "mejor configuración para este dispositivo", "impostazioni migliori per questo dispositivo"}},
+    {TextDescAutoConfig, {"picks the resolution, renderer and filters for this device's speed. the renderer changes at the next start.", "choisit la résolution, le rendu et les filtres selon la vitesse de l'appareil. le rendu change au prochain lancement.", "wählt auflösung, renderer und filter nach der leistung des geräts. der renderer gilt ab dem nächsten start.", "elige la resolución, el renderizador y los filtros según la potencia del dispositivo. el renderizador cambia al próximo inicio.", "sceglie risoluzione, renderer e filtri in base alla potenza del dispositivo. il renderer cambia al prossimo avvio."}},
 };
 const u32 g_NativeTextCount = sizeof(g_NativeTexts) / sizeof(g_NativeTexts[0]);
 const char* const g_TextLanguages[TextLanguages] = {"English", "French", "German", "Spanish", "Italian"};

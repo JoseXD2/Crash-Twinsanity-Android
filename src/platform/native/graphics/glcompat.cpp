@@ -1,6 +1,14 @@
 // OpenGL 3.3 core or OpenGL ES 3.0: see glcompat.h
 #include "glcompat.h"
 
+#include "native.h"
+
+#include <filesystem>
+
+#if defined(TWIN_VULKAN)
+#include "vk/vkgl.h"
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,9 +22,113 @@
 
 namespace NativeGl
 {
+namespace
+{
+bool g_Vulkan = false;
+}
+
+bool Vulkan()
+{
+    return g_Vulkan;
+}
+
+void UseVulkan(bool on)
+{
+#if defined(TWIN_VULKAN)
+    // (asked of the drivers first: an old one, Vulkan 1.1 say, keeps OpenGL with the window never made for Vulkan)
+    g_Vulkan = on && VkGl::Supported();
+#else
+    (void)on;
+#endif
+}
+
+SDL_WindowFlags WindowFlag()
+{
+    return g_Vulkan ? SDL_WINDOW_VULKAN : SDL_WINDOW_OPENGL;
+}
+
+bool StartVulkan(SDL_Window* window)
+{
+#if defined(TWIN_VULKAN)
+    if (g_Vulkan && !VkGl::Start(window))
+    {
+        std::fprintf(stderr, "graphics: no Vulkan renderer (the log says why): OpenGL instead\n");
+        g_Vulkan = false;
+    }
+
+    return g_Vulkan;
+#else
+    (void)window;
+    return false;
+#endif
+}
+
+#if defined(TWIN_VULKAN)
+#define TWIN_VKGL(call, otherwise)                                                                                             \
+    if (g_Vulkan)                                                                                                              \
+    {                                                                                                                          \
+        call;                                                                                                                  \
+    }                                                                                                                          \
+    else                                                                                                                       \
+    {                                                                                                                          \
+        otherwise;                                                                                                             \
+    }
+#else
+#define TWIN_VKGL(call, otherwise) otherwise;
+#endif
+
+SDL_FunctionPointer GetProcAddress(const char* name)
+{
+    TWIN_VKGL(return reinterpret_cast<SDL_FunctionPointer>(VkGl::GetProcAddress(name)), return SDL_GL_GetProcAddress(name))
+}
+
+SDL_GLContext CreateContext(SDL_Window* window)
+{
+    TWIN_VKGL(return static_cast<SDL_GLContext>(VkGl::CreateContext(window)), return SDL_GL_CreateContext(window))
+}
+
+bool MakeCurrentOn(SDL_Window* window, SDL_GLContext context)
+{
+    TWIN_VKGL((void)window; return VkGl::MakeCurrent(context), return SDL_GL_MakeCurrent(window, context))
+}
+
+SDL_GLContext CurrentContext()
+{
+    TWIN_VKGL(return static_cast<SDL_GLContext>(VkGl::CurrentContext()), return SDL_GL_GetCurrentContext())
+}
+
+void DestroyGlContext(SDL_GLContext context)
+{
+    TWIN_VKGL(VkGl::DestroyContext(context), SDL_GL_DestroyContext(context))
+}
+
+void SwapWindow(SDL_Window* window)
+{
+#if defined(TWIN_VULKAN)
+    // (Vulkan has shown 5 s of pictures: system.cpp's mark of a start in progress gone)
+    static u32 shown = 0;
+    if (g_Vulkan && ++shown == 300)
+    {
+        std::error_code ignored;
+        std::filesystem::remove(Native::SettingsFolder() + "/vulkan_starting.txt", ignored);
+    }
+#endif
+    TWIN_VKGL(VkGl::SwapWindow(window), SDL_GL_SwapWindow(window))
+}
+
+void SetSwapInterval(int interval)
+{
+    TWIN_VKGL(VkGl::SetSwapInterval(interval), SDL_GL_SetSwapInterval(interval))
+}
+
 void SetContextAttributes()
 {
-    if (Es)
+    if (Vulkan())
+    {
+        return;
+    }
+
+    if (EsBuild)
     {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
@@ -84,6 +196,12 @@ void ReportShaderFailure(const char* what, const char* log, const std::string& s
 
 bool HasExtension(const char* name)
 {
+#if defined(TWIN_VULKAN)
+    if (g_Vulkan)
+    {
+        return VkGl::HasExtension(name);
+    }
+#endif
     auto getStringi = reinterpret_cast<const unsigned char* (*)(unsigned, unsigned)>(SDL_GL_GetProcAddress("glGetStringi"));
     auto getIntegerv = reinterpret_cast<void (*)(unsigned, int*)>(SDL_GL_GetProcAddress("glGetIntegerv"));
     if (getStringi != nullptr && getIntegerv != nullptr)
@@ -131,7 +249,13 @@ bool HasExtension(const char* name)
 
 bool DualSourceBlend()
 {
-    if (!Es)
+#if defined(TWIN_VULKAN)
+    if (g_Vulkan)
+    {
+        return VkGl::HasExtension("GL_ARB_blend_func_extended");
+    }
+#endif
+    if (!IsEs())
     {
         return true;
     }
@@ -146,9 +270,43 @@ bool DualSourceBlend()
     return answer;
 }
 
+bool ShaderBlendByFetch()
+{
+    // Asked once, a context current
+    static const bool answer = []
+    {
+        if (!FramebufferFetch())
+        {
+            return false;
+        }
+
+        if (!DualSourceBlend())
+        {
+            return true;
+        }
+
+        // ($TWIN_HW_FETCH=1 or 0: as asked; fetch_off.txt in the settings folder: off, the copies as before)
+        if (const char* forced = std::getenv("TWIN_HW_FETCH"))
+        {
+            return forced[0] == '1';
+        }
+
+        std::error_code missing;
+        if (std::filesystem::exists(Native::SettingsFolder() + "/fetch_off.txt", missing))
+        {
+            return false;
+        }
+
+        auto getString = reinterpret_cast<const unsigned char* (*)(unsigned)>(GetProcAddress("glGetString"));
+        const unsigned char* renderer = getString != nullptr ? getString(0x1F01) : nullptr;
+        return renderer != nullptr && std::strstr(reinterpret_cast<const char*>(renderer), "Adreno") != nullptr;
+    }();
+    return answer;
+}
+
 bool FramebufferFetch()
 {
-    if (!Es)
+    if (!IsEs())
     {
         return false;
     }
@@ -168,7 +326,20 @@ std::string Shader(const char* source)
 
 std::string Shader(const std::string& given)
 {
-    if (!Es)
+    // (a debugging aid: every shader's source into $TWIN_DUMP_SHADERS, a file a source)
+    if (const char* folder = std::getenv("TWIN_DUMP_SHADERS"))
+    {
+        static int number = 0;
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/shader%03d.glsl", folder, number++);
+        if (FILE* file = std::fopen(path, "wb"))
+        {
+            std::fwrite(given.data(), 1, given.size(), file);
+            std::fclose(file);
+        }
+    }
+
+    if (!IsEs())
     {
         return given;
     }
@@ -178,7 +349,9 @@ std::string Shader(const std::string& given)
     std::string head = "#version 300 es\n";
     if (dual)
     {
-        if (DualSourceBlend())
+        // (a shader blend that reads the framebuffer: its outputs as the fetch wants them, the dual-source blend there or not)
+        const bool fetching = text.find("#define FBFETCH 1") != std::string::npos;
+        if (DualSourceBlend() && !fetching)
         {
             head += "#extension GL_EXT_blend_func_extended : require\n";
         }
@@ -219,6 +392,14 @@ std::string Shader(const std::string& given)
 bool CreateOffscreenContext(SDL_Window* mainWindow, SDL_GLContext shareWith, Context* out)
 {
     *out = Context{};
+#if defined(TWIN_VULKAN)
+    // VkGl's: a context with no window (every context shares every object), left not current
+    if (g_Vulkan)
+    {
+        out->context = static_cast<SDL_GLContext>(VkGl::CreateContext(nullptr));
+        return out->context != nullptr;
+    }
+#endif
     SetContextAttributes();
     if (shareWith != nullptr && mainWindow != nullptr)
     {
@@ -331,6 +512,12 @@ bool CreateOffscreenContext(SDL_Window* mainWindow, SDL_GLContext shareWith, Con
 
 bool MakeCurrent(const Context& context)
 {
+#if defined(TWIN_VULKAN)
+    if (g_Vulkan)
+    {
+        return VkGl::MakeCurrent(context.context);
+    }
+#endif
 #if defined(__ANDROID__)
     if (context.egl)
     {
@@ -343,6 +530,17 @@ bool MakeCurrent(const Context& context)
 
 void ReleaseCurrent(const Context& context)
 {
+#if defined(TWIN_VULKAN)
+    if (g_Vulkan)
+    {
+        if (VkGl::CurrentContext() == context.context)
+        {
+            VkGl::MakeCurrent(nullptr);
+        }
+
+        return;
+    }
+#endif
 #if defined(__ANDROID__)
     if (context.egl)
     {
@@ -355,6 +553,12 @@ void ReleaseCurrent(const Context& context)
 
 bool IsCurrent(const Context& context)
 {
+#if defined(TWIN_VULKAN)
+    if (g_Vulkan)
+    {
+        return VkGl::CurrentContext() == context.context;
+    }
+#endif
 #if defined(__ANDROID__)
     if (context.egl)
     {
@@ -375,7 +579,7 @@ void DestroyContext(Context* context)
 #endif
     if (context->context != nullptr)
     {
-        SDL_GL_DestroyContext(context->context);
+        DestroyGlContext(context->context);
         context->context = nullptr;
     }
 

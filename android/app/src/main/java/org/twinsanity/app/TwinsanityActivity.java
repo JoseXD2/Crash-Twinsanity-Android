@@ -1,12 +1,18 @@
 package org.twinsanity.app;
 
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.net.Uri;
 import android.provider.OpenableColumns;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.Settings;
 import android.view.View;
 import android.view.WindowManager;
+
+import java.io.File;
 
 import org.libsdl.app.SDLActivity;
 
@@ -27,6 +33,47 @@ public class TwinsanityActivity extends SDLActivity
     {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // The game's folder on the shared storage wants "all files access" (Android 11 on): asked once, at the first start (the
+        // game starts once the player is back; refused, the app's own folder stays, and the permission can be given later in the
+        // system's settings)
+        if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager())
+        {
+            SharedPreferences preferences = getSharedPreferences("twinsanity", MODE_PRIVATE);
+            if (!preferences.getBoolean("askedAllFiles", false))
+            {
+                preferences.edit().putBoolean("askedAllFiles", true).apply();
+                try
+                {
+                    startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + getPackageName())));
+                }
+                catch (Exception notThere)
+                {
+                    try
+                    {
+                        startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                    }
+                    catch (Exception ignored)
+                    {
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The game's folder on the shared storage, /sdcard/CrashTwinsanity (src/platform/native/system.cpp's SettingsFolder, through
+     * JNI), made if it isn't there; null without "all files access" (then the app's own folder).
+     */
+    public String sharedFolder()
+    {
+        if (Build.VERSION.SDK_INT < 30 || !Environment.isExternalStorageManager())
+        {
+            return null;
+        }
+
+        File folder = new File(Environment.getExternalStorageDirectory(), "CrashTwinsanity");
+        folder.mkdirs();
+        return folder.isDirectory() && folder.canWrite() ? folder.getAbsolutePath() : null;
     }
 
     @Override

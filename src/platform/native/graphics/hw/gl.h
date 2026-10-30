@@ -136,6 +136,12 @@ struct Gl
     void (*EndQuery)(GLenum);
     void (*GetQueryObjectuiv)(GLuint, GLenum, GLuint*);
     void (*GetQueryObjectui64v)(GLuint, GLenum, GLuint64*);
+    // The vertex ring's (hwgs.cpp: the batches' vertexes written into one big buffer, mapped unsynchronized, rather than a new
+    // buffer a batch); null where they're not loaded
+    void* (*MapBufferRange)(GLenum, std::ptrdiff_t, GLsizeiptr, GLbitfield);
+    void (*BufferSubData)(GLenum, std::ptrdiff_t, GLsizeiptr, const void*);
+    GLboolean (*UnmapBuffer)(GLenum);
+    const unsigned char* (*GetString)(GLenum);
 };
 
 // The entry points (loaded the first time, with a context current); false when one is missing
@@ -146,5 +152,7 @@ void DrawNone(Gl& gl);
 // Whether the context is OpenGL ES, and its extensions the renderer asks about (asked of the context LoadGl loaded on)
 bool IsEs();
 bool HasAnisotropy();
+constexpr GLenum GL_DYNAMIC_DRAW = 0x88E8, GL_MAP_WRITE_BIT = 0x0002, GL_MAP_INVALIDATE_RANGE_BIT = 0x0004, GL_MAP_UNSYNCHRONIZED_BIT = 0x0020,
+                 GL_RENDERER = 0x1F01;
 constexpr GLenum GL_IMPLEMENTATION_COLOR_READ_FORMAT = 0x8B9B, GL_IMPLEMENTATION_COLOR_READ_TYPE = 0x8B9A, GL_RGBA_INTEGER = 0x8D99;
 }

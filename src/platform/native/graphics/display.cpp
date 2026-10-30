@@ -155,7 +155,7 @@ s32 g_FrameRate = 0;
 template <typename T>
 void Load(T& function, const char* name)
 {
-    function = reinterpret_cast<T>(SDL_GL_GetProcAddress(name));
+    function = reinterpret_cast<T>(NativeGl::GetProcAddress(name));
     if (function == nullptr)
     {
         std::fprintf(stderr, "graphics: OpenGL has no %s\n", name);
@@ -384,7 +384,7 @@ void PresentTexture(GLuint texture, f32 u0, f32 v0, f32 u1, f32 v1, u32 pictureW
 
     if (!p.vsyncSet)
     {
-        SDL_GL_SetSwapInterval(p.vsync ? 1 : 0);
+        NativeGl::SetSwapInterval(p.vsync ? 1 : 0);
         p.vsyncSet = true;
     }
 
@@ -413,7 +413,7 @@ void PresentTexture(GLuint texture, f32 u0, f32 v0, f32 u1, f32 v1, u32 pictureW
         gl.Uniform1f(gl.GetUniformLocation(p.postProgram, "time"),
                      std::chrono::duration<f32>(std::chrono::steady_clock::now() - started).count());
         NativeUiCrtShaderUniforms(p.postProgram, [](const char* name) {
-            return reinterpret_cast<void*>(SDL_GL_GetProcAddress(name));
+            return reinterpret_cast<void*>(NativeGl::GetProcAddress(name));
         });
     }
 
@@ -429,7 +429,7 @@ void PresentTexture(GLuint texture, f32 u0, f32 v0, f32 u1, f32 v1, u32 pictureW
     }
 
     WriteWindowShot(width, height);
-    SDL_GL_SwapWindow(p.window);
+    NativeGl::SwapWindow(p.window);
 }
 
 void Present(const NativeGraphics::Picture& picture)
@@ -731,20 +731,20 @@ void NativeGraphicsAttachWindow(SDL_Window* window)
 {
     Presenter& p = g_Presenter;
     NativeGl::SetContextAttributes();
-    p.context = SDL_GL_CreateContext(window);
+    p.context = NativeGl::CreateContext(window);
     if (p.context == nullptr)
     {
         std::fprintf(stderr, "graphics: no OpenGL 3.3 context: %s\n", SDL_GetError());
         return;
     }
 
-    SDL_GL_MakeCurrent(window, p.context);
+    NativeGl::MakeCurrentOn(window, p.context);
     // The frames are paced by the vertical blank's own wait
-    SDL_GL_SetSwapInterval(0);
+    NativeGl::SetSwapInterval(0);
     // The graphics card and its driver in the log, for the bug reports: OpenGL's renderer, vendor and version (the driver's own
     // number in it: NVIDIA's "3.3.0 NVIDIA 617.14", AMD's "... Core Profile Context 24.10.1...", Intel's "... Build 31.0.101...",
     // Mesa's), then Windows' adapters and their drivers' versions
-    auto getString = reinterpret_cast<const unsigned char* (*)(GLenum)>(SDL_GL_GetProcAddress("glGetString"));
+    auto getString = reinterpret_cast<const unsigned char* (*)(GLenum)>(NativeGl::GetProcAddress("glGetString"));
     if (getString != nullptr)
     {
         auto text = [getString](GLenum name) {
@@ -1043,6 +1043,11 @@ void ThreadedFrameStats(const Shown* shown)
     if (++pictures % 60 != 0)
     {
         return;
+    }
+
+    if (pictures % 300 == 0)
+    {
+        Native::CheckThreads();
     }
 #endif
     static auto last = std::chrono::steady_clock::now();

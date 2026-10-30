@@ -76,6 +76,7 @@ constexpr OptionInfo Infos[OptionCount] = {
     {OptionTouchControls, "touch_controls", 1, 1},
     {OptionTouchSize, "touch_size", 10, 15},
     {OptionTouchOpacity, "touch_opacity", 6, 10},
+    {OptionRenderer, "renderer", 0, 1},
 };
 
 s32 g_Values[OptionCount];
@@ -255,6 +256,19 @@ void SetOption(Option option, s32 value)
     g_Values[option] = value;
     Save();
     ApplyOption(option);
+}
+
+void PresetOption(Option option, s32 value)
+{
+    Read();
+    g_Values[option] = value;
+    Save();
+}
+
+bool OptionsSaved()
+{
+    Read();
+    return g_FromFile;
 }
 
 void LogOptions()

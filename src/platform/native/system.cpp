@@ -15,8 +15,13 @@
 
 #include <SDL3/SDL.h>
 
+#if defined(__ANDROID__)
+#include <jni.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -139,6 +145,49 @@ void Native::ParseArguments(int& argc, char** argv)
 // The disc image picked before (or now): the app keeps it in its settings (macOS: ~/Library/Application Support/Crash
 // Twinsanity/disc_image.txt; elsewhere $XDG_CONFIG_HOME or ~/.config/crash-twinsanity/), and asks for it with the system's file
 // dialog the first time it's launched without one
+#if defined(__ANDROID__)
+// The activity's sharedFolder (TwinsanityActivity.java): /sdcard/CrashTwinsanity when the app has "all files access", else empty
+std::string AndroidSharedFolder()
+{
+    JNIEnv* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    jobject activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (env == nullptr || activity == nullptr)
+    {
+        return {};
+    }
+
+    std::string path;
+    jclass type = env->GetObjectClass(activity);
+    jmethodID method = env->GetMethodID(type, "sharedFolder", "()Ljava/lang/String;");
+    if (method == nullptr)
+    {
+        env->ExceptionClear();
+    }
+    else
+    {
+        auto result = static_cast<jstring>(env->CallObjectMethod(activity, method));
+        if (env->ExceptionCheck())
+        {
+            env->ExceptionClear();
+        }
+        else if (result != nullptr)
+        {
+            if (const char* chars = env->GetStringUTFChars(result, nullptr))
+            {
+                path = chars;
+                env->ReleaseStringUTFChars(result, chars);
+            }
+
+            env->DeleteLocalRef(result);
+        }
+    }
+
+    env->DeleteLocalRef(type);
+    env->DeleteLocalRef(activity);
+    return path;
+}
+#endif
+
 std::string Native::SettingsFolder()
 {
 #if defined(_WIN32)
@@ -148,16 +197,43 @@ std::string Native::SettingsFolder()
     const char* home = std::getenv("HOME");
     return std::string(home != nullptr ? home : ".") + "/Library/Application Support/Crash Twinsanity";
 #elif defined(__ANDROID__)
-    // Android: the app's external files folder (Android/data/org.twinsanity.native/files on the shared storage, reachable
-    // over USB and by file managers), else its private internal one
-    const char* external = SDL_GetAndroidExternalStoragePath();
-    if (external != nullptr && (SDL_GetAndroidExternalStorageState() & SDL_ANDROID_EXTERNAL_STORAGE_WRITE) != 0)
+    // Android: /sdcard/CrashTwinsanity with "all files access" (the activity asks at the first start), its contents brought over
+    // from the app's own folder the first time; else the app's external files folder (Android/data/org.twinsanity.native/files on
+    // the shared storage, reachable over USB), else its private internal one. Decided once a run
+    static bool decided = false;
+    static std::string folder;
+    if (decided)
     {
-        return external;
+        return folder;
+    }
+
+    decided = true;
+    const char* external = SDL_GetAndroidExternalStoragePath();
+    const bool externalWritable = external != nullptr && (SDL_GetAndroidExternalStorageState() & SDL_ANDROID_EXTERNAL_STORAGE_WRITE) != 0;
+    folder = AndroidSharedFolder();
+    if (!folder.empty())
+    {
+        std::error_code error;
+        if (externalWritable && !std::filesystem::exists(folder + "/options.txt", error) &&
+            std::filesystem::exists(std::string(external) + "/options.txt", error))
+        {
+            std::filesystem::copy(external, folder, std::filesystem::copy_options::recursive | std::filesystem::copy_options::skip_existing,
+                                  error);
+            SDL_Log("settings: the app folder's files copied to %s%s", folder.c_str(), error ? " (not all)" : "");
+        }
+
+        return folder;
+    }
+
+    if (externalWritable)
+    {
+        folder = external;
+        return folder;
     }
 
     const char* internal = SDL_GetAndroidInternalStoragePath();
-    return internal != nullptr ? internal : ".";
+    folder = internal != nullptr ? internal : ".";
+    return folder;
 #else
     const char* home = std::getenv("HOME");
     const char* config = std::getenv("XDG_CONFIG_HOME");
@@ -345,7 +421,41 @@ SDL_Window* GameWindow()
     }
 
     const NativeUi::Resolution defaults = NativeUi::DefaultResolution();
-    SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    // A phone's first start: the settings chosen for it (the scale, the renderer, the filters) before anything reads them
+    NativeUi::AutoConfigureFirstStart();
+    // The renderer's choice first (the window is made for it): the option, or $TWIN_RENDERER (vulkan, opengl) over it
+    bool vulkan = NativeUi::GetOption(NativeUi::OptionRenderer) == 1;
+    if (const char* forced = std::getenv("TWIN_RENDERER"))
+    {
+        vulkan = std::strcmp(forced, "vulkan") == 0;
+    }
+
+    // (force_opengl.txt in the settings folder: OpenGL whatever the option says, the way back when Vulkan doesn't get as far as
+    // the options)
+    std::error_code missing;
+    if (vulkan && std::filesystem::exists(Native::SettingsFolder() + "/force_opengl.txt", missing))
+    {
+        Native::Log("graphics: force_opengl.txt: OpenGL");
+        vulkan = false;
+    }
+
+    // (vulkan_starting.txt: made before a start with Vulkan, gone once it has shown a few seconds of pictures; there at a start, the
+    // last one with Vulkan didn't get that far, so OpenGL, the option too)
+    const std::string starting = Native::SettingsFolder() + "/vulkan_starting.txt";
+    if (vulkan && std::filesystem::exists(starting, missing))
+    {
+        Native::Log("graphics: the last start with Vulkan ended before its pictures: OpenGL from now on");
+        std::filesystem::remove(starting, missing);
+        NativeUi::PresetOption(NativeUi::OptionRenderer, 0);
+        vulkan = false;
+    }
+
+    NativeGl::UseVulkan(vulkan);
+    if (NativeGl::Vulkan())
+    {
+        std::ofstream(starting) << "Vulkan is starting (system.cpp): this file goes once it shows pictures\n";
+    }
+    SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #if defined(__ANDROID__)
     // The whole screen, landscape
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
@@ -353,11 +463,26 @@ SDL_Window* GameWindow()
 #endif
     // The context's kind before the window: its surface's configuration is chosen then (EGL)
     NativeGl::SetContextAttributes();
-    g_Window = SDL_CreateWindow("Crash Twinsanity", defaults.windowWidth, defaults.windowHeight, flags);
+    g_Window = SDL_CreateWindow("Crash Twinsanity", defaults.windowWidth, defaults.windowHeight, flags | NativeGl::WindowFlag());
+    if (NativeGl::Vulkan() && (g_Window == nullptr || !NativeGl::StartVulkan(g_Window)))
+    {
+        // No Vulkan renderer: the window made again for OpenGL
+        NativeGl::UseVulkan(false);
+        if (g_Window != nullptr)
+        {
+            SDL_DestroyWindow(g_Window);
+        }
+
+        NativeGl::SetContextAttributes();
+        g_Window = SDL_CreateWindow("Crash Twinsanity", defaults.windowWidth, defaults.windowHeight, flags | SDL_WINDOW_OPENGL);
+    }
+
     if (g_Window == nullptr)
     {
         Native::Fatal("the window couldn't be made: %s", SDL_GetError());
     }
+
+    Native::Log("graphics: the renderer is %s", NativeGl::Vulkan() ? "Vulkan (VkGl)" : "OpenGL");
 
     return g_Window;
 }
@@ -546,6 +671,92 @@ bool Native::IsMobile()
 #endif
 }
 
+#if defined(__linux__)
+namespace
+{
+struct PinnedThread
+{
+    pid_t tid;
+    std::string name;
+    cpu_set_t set;
+    bool pinned;
+    int refusal;
+};
+std::mutex g_PinnedLock;
+std::vector<PinnedThread> g_Pinned;
+
+std::string ReadLine(const std::string& path)
+{
+    std::ifstream file(path);
+    std::string line;
+    std::getline(file, line);
+    return line;
+}
+
+std::string SetText(const cpu_set_t& set)
+{
+    std::string text;
+    for (int cpu = 0; cpu < 64; cpu++)
+    {
+        if (CPU_ISSET(cpu, &set))
+        {
+            text += (text.empty() ? "" : ",") + std::to_string(cpu);
+        }
+    }
+
+    return text.empty() ? "none" : text;
+}
+}
+#endif
+
+void Native::CheckThreads()
+{
+#if defined(__linux__)
+    std::lock_guard lock(g_PinnedLock);
+    static bool told = false;
+    std::string line;
+    for (PinnedThread& t : g_Pinned)
+    {
+        if (!t.pinned)
+        {
+            t.pinned = sched_setaffinity(t.tid, sizeof(t.set), &t.set) == 0;
+            t.refusal = t.pinned ? 0 : errno;
+        }
+
+        // The core it last ran on: /proc/self/task/TID/stat's 39th field
+        std::string stat = ReadLine("/proc/self/task/" + std::to_string(t.tid) + "/stat");
+        int cpu = -1;
+        size_t close = stat.rfind(')');
+        if (close != std::string::npos)
+        {
+            std::istringstream fields(stat.substr(close + 2));
+            std::string field;
+            for (int i = 3; i <= 39 && fields >> field; i++)
+            {
+                if (i == 39)
+                {
+                    cpu = std::atoi(field.c_str());
+                }
+            }
+        }
+
+        cpu_set_t now;
+        CPU_ZERO(&now);
+        sched_getaffinity(t.tid, sizeof(now), &now);
+        line += (line.empty() ? "" : "; ") + t.name + " on core " + std::to_string(cpu) + " (may use " + SetText(now) + (t.pinned ? "" : ", pinning refused: " + std::string(std::strerror(t.refusal))) + ")";
+    }
+
+    if (!told)
+    {
+        told = true;
+        Log("threads: the process's cpuset %s, cores allowed %s", ReadLine("/proc/self/cpuset").c_str(),
+            ReadLine("/sys/fs/cgroup/cpuset" + ReadLine("/proc/self/cpuset") + "/cpus").c_str());
+    }
+
+    Log("threads now: %s", line.c_str());
+#endif
+}
+
 void Native::PinToFastCores(const char* name, bool busiest)
 {
     RegisterProfiledThread(name);
@@ -646,6 +857,12 @@ void Native::PinToFastCores(const char* name, bool busiest)
 
     pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
     bool pinned = sched_setaffinity(tid, sizeof(set), &set) == 0;
+    const int refusal = pinned ? 0 : errno;
+    {
+        std::lock_guard lock(g_PinnedLock);
+        g_Pinned.push_back({tid, name, set, pinned, refusal});
+    }
+
     // A higher priority (Android lets an app raise its threads this far; elsewhere it may refuse)
     bool raised = setpriority(PRIO_PROCESS, static_cast<id_t>(tid), -10) == 0;
     std::string list;
@@ -654,7 +871,8 @@ void Native::PinToFastCores(const char* name, bool busiest)
         list += (list.empty() ? "" : ",") + std::to_string(cpu);
     }
 
-    Log("threads: %s on cores %s%s%s", name, list.c_str(), pinned ? "" : " (the affinity was refused)", raised ? ", priority raised" : "");
+    Log("threads: %s on cores %s%s%s", name, list.c_str(), pinned ? "" : (std::string(" (the affinity was refused: ") + std::strerror(refusal) + ")").c_str(),
+        raised ? ", priority raised" : "");
 #else
     (void)name;
 #endif

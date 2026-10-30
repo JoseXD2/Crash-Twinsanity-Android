@@ -165,6 +165,13 @@ PromptStyle StyleFromEnvironment(bool* forced)
         // The options' controller choice: automatic, or the one chosen
         constexpr PromptStyle Chosen[] = {PromptKeyboard, PromptKeyboard, PromptXbox, PromptPlayStation, PromptSwitch};
         s32 choice = GetOption(OptionController);
+        // (a phone: the keyboard's prompts only for a keyboard plugged in, so the keyboard choice is the automatic one there; the
+        // touch controls are a PlayStation pad)
+        if (Native::IsMobile() && choice == 1)
+        {
+            choice = 0;
+        }
+
         *forced = choice != 0;
         return Chosen[choice];
     }

@@ -19,6 +19,11 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -gline-tables-only -DNDEBUG")
 find_package(SDL3 REQUIRED CONFIG)
 find_package(OpenGL REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+# VkGl (src/platform/native/graphics/vk/: OpenGL in Vulkan, $TWIN_RENDERER=vulkan): the Vulkan headers and glslang
+option(TWIN_VULKAN "Build VkGl, the Vulkan renderer" ON)
+if(TWIN_VULKAN)
+    find_package(glslang REQUIRED CONFIG)
+endif()
 # The movies' pictures (src/platform/native/movie/): FFmpeg's libavcodec, as the game links it
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET GLOBAL libavcodec libavutil)
@@ -52,4 +57,8 @@ target_compile_options(${target} PRIVATE
     -ffp-contract=off -Wall -Wno-invalid-offsetof -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable
     -Wno-unknown-pragmas -Wno-missing-braces -Wno-mismatched-tags)
 target_link_libraries(${target} PRIVATE SDL3::SDL3 OpenGL::GL PkgConfig::FFMPEG)
+if(TWIN_VULKAN)
+    target_compile_definitions(${target} PRIVATE TWIN_VULKAN)
+    target_link_libraries(${target} PRIVATE glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
+endif()
 endforeach()

@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iterator>
 #include <map>
 #include <array>
@@ -1457,6 +1458,10 @@ public:
     void BeforeCpuRead(const Gs::PageSet& pages) override;
     void BeforeCpuWrite(const Gs::PageSet& pages) override { BeforeCpuRead(pages); }
     void Flush() override;
+    // The batches' vertex arrays (attributes 0-4 of HwVertex) on a buffer; the measuring's end of a batch (way 0 a buffer a batch,
+    // 1 the pool)
+    void SetUpVertexArray(GLuint vertexArray, GLuint buffer);
+    void EndTrialBatch(int way, u64 ns);
     bool PagesGpuNewer(const Gs::PageSet& pages) override
     {
         ProcessWrites();
@@ -1528,6 +1533,38 @@ private:
     std::unordered_map<const void*, CachedTexture> textures_;
     GLuint vertexArray_ = 0;
     GLuint vertexBuffer_ = 0;
+    // How a batch's vertexes reach the GPU (VertexUpload): a new buffer a batch (glBufferData: ANGLE's and Mali's fast path), a pool
+    // of buffers reused in turn (each allocated once, rewritten with glBufferSubData: no allocation a batch), or one ring buffer
+    // mapped unsynchronized. Qualcomm's driver makes a kernel call for each new buffer (the Poco F5: 0.12 ms a batch, 25 ms a frame)
+    // and two for each mapping (0.6 ms a batch: the ring was 4 times worse), so there the choice is measured: the batches drawn in
+    // turns of each way, the cheaper kept ("auto"). $TWIN_HW_VERTEX_UPLOAD or vertex_upload.txt in the settings folder: batch,
+    // pool, ring or auto
+    enum class VertexUpload
+    {
+        Batch,
+        Pool,
+        Ring,
+    };
+    static constexpr size_t RingBytes = 8u * 1024 * 1024;
+    static constexpr u32 PoolSlots = 256;
+    struct PoolSlot
+    {
+        GLuint vertexArray = 0;
+        GLuint buffer = 0;
+        size_t capacity = 0;
+    };
+    VertexUpload vertexUpload_ = VertexUpload::Batch;
+    size_t ringAt_ = 0;
+    std::vector<PoolSlot> pool_;
+    u32 poolNext_ = 0;
+    // The measuring ("auto"): turns of TrialBatches batches each way, Trials of them, then the cheaper (its ns a batch) kept
+    bool trying_ = false;
+    static constexpr u32 TrialBatches = 600;
+    static constexpr u32 Trials = 6;
+    u32 trialBatches_ = 0;
+    u32 trialTurns_ = 0;
+    u64 trialNs_[2] = {};
+    u64 trialCount_[2] = {};
     GLuint depthProgram_ = 0;
     GLuint mergeProgram_ = 0;
     GLuint mergeTexture_ = 0;
@@ -1863,6 +1900,46 @@ void HwGs::MakeCurrent()
     currentThread_ = self;
 }
 
+void HwGs::SetUpVertexArray(GLuint vertexArray, GLuint buffer)
+{
+    Gl& gl = GetGl();
+    gl.BindVertexArray(vertexArray);
+    gl.BindBuffer(GL_ARRAY_BUFFER, buffer);
+    gl.VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, x)));
+    gl.VertexAttribIPointer(1, 1, GL_UNSIGNED_INT, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, z)));
+    gl.VertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, r)));
+    gl.VertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, s)));
+    gl.VertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, fog)));
+    for (GLuint i = 0; i < 5; i++)
+    {
+        gl.EnableVertexAttribArray(i);
+    }
+}
+
+void HwGs::EndTrialBatch(int way, u64 ns)
+{
+    trialNs_[way] += ns;
+    trialCount_[way]++;
+    if (++trialBatches_ < TrialBatches)
+    {
+        return;
+    }
+
+    trialBatches_ = 0;
+    if (++trialTurns_ < Trials * 2)
+    {
+        vertexUpload_ = vertexUpload_ == VertexUpload::Pool ? VertexUpload::Batch : VertexUpload::Pool;
+        return;
+    }
+
+    const double batch = static_cast<double>(trialNs_[0]) / static_cast<double>(std::max<u64>(1, trialCount_[0])) / 1000.0;
+    const double pool = static_cast<double>(trialNs_[1]) / static_cast<double>(std::max<u64>(1, trialCount_[1])) / 1000.0;
+    vertexUpload_ = pool < batch ? VertexUpload::Pool : VertexUpload::Batch;
+    trying_ = false;
+    Native::Log("graphics: the vertexes measured: a buffer a batch %.1f us a batch, a pool of buffers %.1f us: %s kept", batch, pool,
+                vertexUpload_ == VertexUpload::Pool ? "the pool" : "a buffer a batch");
+}
+
 bool HwGs::Init()
 {
     if (!RenderContext(&context_) && !PresenterContext(&context_))
@@ -1891,24 +1968,59 @@ bool HwGs::Init()
 
     if (IsEs())
     {
-        Native::Log("graphics: OpenGL ES: dual-source blend %s, framebuffer fetch %s, anisotropy %s",
+        Native::Log("graphics: OpenGL ES: dual-source blend %s, framebuffer fetch %s%s, anisotropy %s",
                     NativeGl::DualSourceBlend() ? "yes" : "no (the shader blends)", NativeGl::FramebufferFetch() ? "yes" : "no",
+                    NativeGl::ShaderBlendByFetch() ? " (the shader blend reads it)" : "",
                     HasAnisotropy() ? "yes" : "no");
     }
 
     Gl& gl = GetGl();
     gl.GenVertexArrays(1, &vertexArray_);
     gl.GenBuffers(1, &vertexBuffer_);
-    gl.BindVertexArray(vertexArray_);
-    gl.BindBuffer(GL_ARRAY_BUFFER, vertexBuffer_);
-    gl.VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, x)));
-    gl.VertexAttribIPointer(1, 1, GL_UNSIGNED_INT, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, z)));
-    gl.VertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, r)));
-    gl.VertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, s)));
-    gl.VertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(HwVertex), reinterpret_cast<void*>(offsetof(HwVertex, fog)));
-    for (GLuint i = 0; i < 5; i++)
+    SetUpVertexArray(vertexArray_, vertexBuffer_);
+
     {
-        gl.EnableVertexAttribArray(i);
+        std::string wanted;
+        if (const char* given = std::getenv("TWIN_HW_VERTEX_UPLOAD"))
+        {
+            wanted = given;
+        }
+        else
+        {
+            std::ifstream file(Native::SettingsFolder() + "/vertex_upload.txt");
+            file >> wanted;
+        }
+
+        const unsigned char* renderer = gl.GetString != nullptr ? gl.GetString(GL_RENDERER) : nullptr;
+        const bool adreno = renderer != nullptr && std::strstr(reinterpret_cast<const char*>(renderer), "Adreno") != nullptr;
+        const bool canMap = gl.MapBufferRange != nullptr && gl.UnmapBuffer != nullptr;
+        const bool canPool = gl.BufferSubData != nullptr;
+        if (wanted.empty())
+        {
+            wanted = adreno && !NativeGl::Vulkan() ? "auto" : "batch";
+        }
+
+        vertexUpload_ = VertexUpload::Batch;
+        if (wanted == "pool" && canPool)
+        {
+            vertexUpload_ = VertexUpload::Pool;
+        }
+        else if (wanted == "ring" && canMap)
+        {
+            vertexUpload_ = VertexUpload::Ring;
+            gl.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(RingBytes), nullptr, GL_STREAM_DRAW);
+        }
+        else if (wanted == "auto" && canPool)
+        {
+            vertexUpload_ = VertexUpload::Pool;
+            trying_ = true;
+        }
+
+        Native::Log("graphics: %s, the vertexes %s", renderer != nullptr ? reinterpret_cast<const char*>(renderer) : "an unnamed GL",
+                    trying_ ? "in a buffer a batch or a pool of buffers, whichever is faster (measured)"
+                    : vertexUpload_ == VertexUpload::Pool ? "in a pool of buffers"
+                    : vertexUpload_ == VertexUpload::Ring ? "in a ring buffer"
+                                                    : "in a buffer a batch");
     }
 
     gl.GenVertexArrays(1, &emptyArray_);
@@ -1959,7 +2071,7 @@ const Program& HwGs::ProgramFor(u32 bits)
     define("NATIVEDEPTH", (bits & BitNativeDepth) ? 1 : 0);
     // The shader blend's destination: the framebuffer's own pixel where the GPU lets a fragment shader read it (OpenGL ES with
     // GL_EXT_shader_framebuffer_fetch: no copy of the target before the batch), else the copy made before the batch
-    bool fetch = (bits & BitShaderBlend) && !NativeGl::DualSourceBlend() && NativeGl::FramebufferFetch();
+    bool fetch = (bits & BitShaderBlend) && NativeGl::ShaderBlendByFetch();
     define("FBFETCH", fetch ? 1 : 0);
     header += fetch ? "#define DESTINATION outColour\n" : "#define DESTINATION texelFetch(destination, ivec2(gl_FragCoord.xy), 0)\n";
     GLuint vertex = CompileShader(GL_VERTEX_SHADER, VertexSource);
@@ -4631,7 +4743,7 @@ bool HwGs::Draw(Gs::Gs::DrawState& state, const Gs::Vertex* vertexes, u32 count)
         // Without the dual-source blend (Mali's own driver) the shader blends anyway, and one that reads the framebuffer tests
         // the alpha there: no stencil pass, no copy of the target. With it (ANGLE on Vulkan) GL's blend and the stencil keep
         // the batches whole, and its framebuffer reads cost a pass each
-        static const bool fetch = !NativeGl::DualSourceBlend() && NativeGl::FramebufferFetch();
+        static const bool fetch = NativeGl::ShaderBlendByFetch();
         if (alphaKept && !noStencilDate && !fetch)
         {
             stencilDate = true;
@@ -5514,7 +5626,7 @@ void HwGs::AddPrimitive(const Gs::Gs::DrawState& state, const Gs::Vertex* vertex
     // The shader's blend reads a copy of the destination from before the batch: a primitive over an earlier one of the batch
     // would read what was there before that one, so the batch ends first. Where the shader reads the framebuffer itself
     // (the fetch) it sees the earlier one's pixels, and the batch goes on
-    static const bool fetch = !NativeGl::DualSourceBlend() && NativeGl::FramebufferFetch();
+    static const bool fetch = NativeGl::ShaderBlendByFetch();
     if (batching_ && shaderBlend && !fetch)
     {
         for (const Rect& earlier : batchRects_)
@@ -5877,7 +5989,7 @@ void HwGs::Flush()
     GLuint destination = 0;
     // (the shader reads the framebuffer itself where it can: no copy for its blend)
     // (ANGLE on Vulkan has the fetch too, but drew wrong with it, and slower: the copies stay there)
-    static const bool fetch = !NativeGl::DualSourceBlend() && NativeGl::FramebufferFetch();
+    static const bool fetch = NativeGl::ShaderBlendByFetch();
     if (((k.program & BitShaderBlend) && !fetch) || (k.stencilDate && !stencilKept))
     {
         // The shader's blend reads the batch's rectangle; the stencil's pass the whole scissor
@@ -6047,9 +6159,98 @@ void HwGs::Flush()
         gl.BindSampler(0, SamplerFor(k.minFilter, k.magFilter, k.wrapS, k.wrapT, k.anisotropy));
     }
 
-    gl.BindVertexArray(vertexArray_);
-    gl.BindBuffer(GL_ARRAY_BUFFER, vertexBuffer_);
-    gl.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertexes_.size() * sizeof(HwVertex)), vertexes_.data(), GL_STREAM_DRAW);
+    // (measuring: this batch's upload and draws timed for the way it used)
+    struct TrialTimer
+    {
+        HwGs* gs;
+        int way;
+        std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+        ~TrialTimer()
+        {
+            if (way >= 0)
+            {
+                gs->EndTrialBatch(way, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - began).count()));
+            }
+        }
+    } trialTimer{this, trying_ ? (vertexUpload_ == VertexUpload::Pool ? 1 : 0) : -1};
+    const size_t vertexBytes = vertexes_.size() * sizeof(HwVertex);
+    GLint firstVertex = 0;
+    bool written = false;
+    if (vertexUpload_ == VertexUpload::Pool)
+    {
+        // The next buffer of the pool, its vertex array set up for it once; grown (allocated again) when the batch doesn't fit
+        if (pool_.empty())
+        {
+            pool_.resize(PoolSlots);
+        }
+
+        PoolSlot& slot = pool_[poolNext_];
+        poolNext_ = (poolNext_ + 1) % PoolSlots;
+        if (slot.vertexArray == 0)
+        {
+            gl.GenVertexArrays(1, &slot.vertexArray);
+            gl.GenBuffers(1, &slot.buffer);
+            SetUpVertexArray(slot.vertexArray, slot.buffer);
+        }
+
+        gl.BindVertexArray(slot.vertexArray);
+        gl.BindBuffer(GL_ARRAY_BUFFER, slot.buffer);
+        if (vertexBytes > slot.capacity)
+        {
+            size_t capacity = 64u * 1024;
+            while (capacity < vertexBytes)
+            {
+                capacity *= 2;
+            }
+
+            gl.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(capacity), nullptr, GL_DYNAMIC_DRAW);
+            slot.capacity = capacity;
+        }
+
+        gl.BufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(vertexBytes), vertexes_.data());
+        written = true;
+    }
+    else
+    {
+        gl.BindVertexArray(vertexArray_);
+        gl.BindBuffer(GL_ARRAY_BUFFER, vertexBuffer_);
+    }
+
+    if (vertexUpload_ == VertexUpload::Ring && vertexBytes <= RingBytes)
+    {
+        // The next whole vertex's place; the ring orphaned when the batch doesn't fit (the GPU keeps the old storage it reads)
+        size_t at = (ringAt_ + sizeof(HwVertex) - 1) / sizeof(HwVertex) * sizeof(HwVertex);
+        if (at + vertexBytes > RingBytes)
+        {
+            gl.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(RingBytes), nullptr, GL_STREAM_DRAW);
+            at = 0;
+        }
+
+        void* mapped = gl.MapBufferRange(GL_ARRAY_BUFFER, static_cast<std::ptrdiff_t>(at), static_cast<GLsizeiptr>(vertexBytes),
+                                         GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+        if (mapped != nullptr)
+        {
+            std::memcpy(mapped, vertexes_.data(), vertexBytes);
+            if (gl.UnmapBuffer(GL_ARRAY_BUFFER) != GL_FALSE)
+            {
+                firstVertex = static_cast<GLint>(at / sizeof(HwVertex));
+                ringAt_ = at + vertexBytes;
+                written = true;
+            }
+        }
+
+        if (!written)
+        {
+            Native::Log("graphics: the vertex ring's mapping failed: a buffer a batch from now on");
+            vertexUpload_ = VertexUpload::Batch;
+        }
+    }
+
+    if (!written)
+    {
+        gl.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertexBytes), vertexes_.data(), GL_STREAM_DRAW);
+    }
 
     const Gs::Gs& gs = gs_;
     (void)gs;
@@ -6141,7 +6342,7 @@ void HwGs::Flush()
         gl.ColorMask(colourOn && (mask & 1) ? GL_TRUE : GL_FALSE, colourOn && (mask & 2) ? GL_TRUE : GL_FALSE,
                      colourOn && (mask & 4) ? GL_TRUE : GL_FALSE, colourOn && alphaOn && (mask & 8) ? GL_TRUE : GL_FALSE);
         gl.DepthMask(depthOn && k.depthWrite ? GL_TRUE : GL_FALSE);
-        gl.DrawArrays(k.primitive, 0, static_cast<GLsizei>(vertexes_.size()));
+        gl.DrawArrays(k.primitive, firstVertex, static_cast<GLsizei>(vertexes_.size()));
     };
 
     // The pixels passing the alpha test with every write; then a failed test's AFAIL: the failing pixels with the frame only

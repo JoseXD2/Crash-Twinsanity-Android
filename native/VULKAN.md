@@ -24,7 +24,31 @@ What Vulkan gives, in order of what it is worth here:
 5. `VK_EXT_load_store_op_none` / `DONT_CARE` for what isn't read back: the depth of a pass whose depth is never read again isn't
    stored.
 
-## The stages
+## The path taken first: VkGl (OpenGL in Vulkan)
+
+Rather than a second GS backend written beside `HwGs`, the renderer's own GL is carried out with Vulkan: `graphics/vk/vkgl*.cpp`
+(`vkgl.h` says what it is). The GL users (the hardware renderer, the presenter, the UI's overlay, the launcher) load their entry
+points from `VkGl::GetProcAddress` and make their contexts with `VkGl::CreateContext` when the run uses it (`glcompat.h`'s
+`NativeGl::Vulkan()`); nothing else of theirs changes, so `HwGs` stays one renderer, checked once. What it takes away is ANGLE
+(point 1 below: its translation and checks), and it is where the pass control (points 2, 3, 5) goes next, since it sees every
+framebuffer change and every copy.
+
+- The parts: `vkgldevice.cpp` (the instance, device, memory blocks, submissions by serial with fences, the swapchain: the default
+  framebuffer is an image of our own blitted upside down into it), `vkglcontext.cpp` (a context: its commands, its stream buffer
+  of vertexes and uniforms, its descriptor pools), `vkglobjects.cpp` (textures as images, all in the GENERAL layout; samplers;
+  timestamp queries), `vkglprogram.cpp` (GLSL 330 core made 450 and compiled by glslang with the relaxed Vulkan rules: the loose
+  uniforms in one block, read back by reflection), `vkgldraw.cpp` (dynamic rendering, pipelines by state with the depth, stencil,
+  viewport and scissor dynamic, clears, uploads, reads, blits as draws), `vkglentry.cpp` (the GL entry points).
+- Chosen by the Display page's "renderer" (options.txt's `renderer=1`) or `$TWIN_RENDERER=vulkan`, at the start: the window is
+  made with `SDL_WINDOW_VULKAN`; when Vulkan doesn't start the window is made again for OpenGL (the log says which it is).
+- Checked: `vktest` (a GL program run on Mesa's GL and on VkGl over lavapipe: textures, blending, depth, stencil, dual-source, an
+  integer target read back, a flipped linear blit, a sub-image upload with a row length, mipmaps by LOD, the default
+  framebuffer) is pixel-identical, with the validation layer silent; the harness's replays run through it
+  (`TWIN_RENDERER=vulkan graphics-harness OUT --replay FILE --hardware 1`).
+- Built with glslang 15.1.0 (static, no optimizer, no HLSL): `build_android.py` downloads and builds it into
+  `build/android/deps`; on Linux, glslang-dev.
+
+## The stages (the native backend, if VkGl isn't enough)
 
 Each stage is checked against the software GS with the harness's replays (`--replay FILE --hardware 1`, native/GRAPHICS.md's
 "The hardware renderer"): the picture out of the Vulkan path compared pixel by pixel as the GL path's is. The GL path stays
